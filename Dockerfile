@@ -22,18 +22,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 RUN git clone --depth 1 --branch ${LLAMA_CPP_REF} https://github.com/ggml-org/llama.cpp.git .
 
-# The build host has no GPU, so the CUDA *driver* lib (libcuda.so, providing
-# symbols like cuGetErrorString that llama.cpp's CUDA backend links against)
-# only exists as a stub under .../lib64/stubs in the devel image. Point the
-# linker at it explicitly or the final `llama-server` link fails with
-# "undefined reference to `cuGetErrorString'".
+# The build host has no GPU, so libggml-cuda.so is left with an unresolved
+# reference to the CUDA *driver* API (cuGetErrorString, part of libcuda.so,
+# which is only present as a runtime driver component on an actual GPU host
+# at /usr/local/cuda/lib64/stubs in this image). That's fine - the real
+# libcuda.so.1 will be there on the Runpod GPU worker at runtime - but the
+# executable link step needs to be told not to fail over it, per
+# https://github.com/ggml-org/llama.cpp/issues/10367.
 ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
 RUN cmake -B build \
       -DGGML_CUDA=ON \
       -DLLAMA_CURL=OFF \
       -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
-      -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+      -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,--allow-shlib-undefined" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,--allow-shlib-undefined" \
     && cmake --build build --config Release --target llama-server -j"$(nproc)"
 
 # ---------- Stage 2: slim CUDA runtime + Python handler ----------
