@@ -22,10 +22,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 RUN git clone --depth 1 --branch ${LLAMA_CPP_REF} https://github.com/ggml-org/llama.cpp.git .
 
+# The build host has no GPU, so the CUDA *driver* lib (libcuda.so, providing
+# symbols like cuGetErrorString that llama.cpp's CUDA backend links against)
+# only exists as a stub under .../lib64/stubs in the devel image. Point the
+# linker at it explicitly or the final `llama-server` link fails with
+# "undefined reference to `cuGetErrorString'".
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
 RUN cmake -B build \
       -DGGML_CUDA=ON \
       -DLLAMA_CURL=OFF \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
     && cmake --build build --config Release --target llama-server -j"$(nproc)"
 
 # ---------- Stage 2: slim CUDA runtime + Python handler ----------
