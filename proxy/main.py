@@ -41,7 +41,7 @@ if not RUNPOD_API_KEY or not RUNPOD_ENDPOINT_ID:
     raise RuntimeError(
         "RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID must be set (see .env.example)"
     )
-RUNPOD_API_BASE = os.environ.get("RUNPOD_API_BASE", "https://api.runpod.io/v2")
+RUNPOD_API_BASE = os.environ.get("RUNPOD_API_BASE", "https://api.runpod.ai/v2")
 RUNPOD_BASE = f"{RUNPOD_API_BASE}/{RUNPOD_ENDPOINT_ID}"
 
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")

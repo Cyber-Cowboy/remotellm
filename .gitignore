@@ -1,5 +1,6 @@
 .env
 deploy/infra_state.json
+deploy/modal_state.json
 *.gguf
 *.log
 __pycache__/

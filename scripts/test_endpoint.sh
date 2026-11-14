@@ -14,7 +14,7 @@ set -euo pipefail
 
 : "${RUNPOD_API_KEY:?set RUNPOD_API_KEY}"
 : "${RUNPOD_ENDPOINT_ID:?set RUNPOD_ENDPOINT_ID}"
-BASE="https://api.runpod.io/v2/${RUNPOD_ENDPOINT_ID}"
+BASE="https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}"
 AUTH=(-H "Authorization: Bearer ${RUNPOD_API_KEY}" -H "Content-Type: application/json")
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-60}"
 

@@ -38,4 +38,15 @@ python3 -m modal secret create gptoss-worker-secrets \
   LOG_PROMPTS="${LOG_PROMPTS:-false}" \
   --force
 
-python3 -m modal deploy modal_app.py
+python3 -m modal deploy modal_app.py 2>&1 | tee /tmp/modal_deploy_output.$$.log
+url=$(grep -oE 'https://[A-Za-z0-9.-]*modal\.run[A-Za-z0-9/_-]*' /tmp/modal_deploy_output.$$.log | head -1 || true)
+rm -f /tmp/modal_deploy_output.$$.log
+if [ -n "$url" ]; then
+  python3 -c "import json; json.dump({'web_url': '$url'}, open('deploy/modal_state.json', 'w'), indent=2)"
+  echo
+  echo "Base URL for clients (OpenAI SDK base_url, append /v1): $url/v1"
+else
+  echo
+  echo "Could not auto-detect the web URL from deploy output — check it with:"
+  echo "  python3 -m modal app list"
+fi

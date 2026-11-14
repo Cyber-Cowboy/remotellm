@@ -54,9 +54,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--image", required=True, help="e.g. docker.io/you/gptoss-120b-worker:latest")
     p.add_argument("--name", default="gptoss-120b")
-    p.add_argument("--data-center", default="US-KS-2")
+    p.add_argument("--data-center", default="US-CA-2")  # must support network volumes; see Runpod's /datacenters
     p.add_argument("--volume-size-gb", type=int, default=100)
-    p.add_argument("--gpu-type-ids", nargs="+", default=["NVIDIA A100 80GB PCIe", "NVIDIA H100 80GB PCIe"])
+    p.add_argument("--gpu-type-ids", nargs="+",
+                    default=["NVIDIA A100 80GB PCIe", "NVIDIA H100 PCIe", "NVIDIA A100-SXM4-80GB", "NVIDIA H100 80GB HBM3"])
     p.add_argument("--idle-timeout", type=int, default=60)
     p.add_argument("--workers-max", type=int, default=1)
     p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
