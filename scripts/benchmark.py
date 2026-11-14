@@ -27,7 +27,7 @@ def run_once(client: OpenAI, model: str, label: str):
     with client.chat.completions.stream(
         model=model,
         messages=[{"role": "user", "content": PROMPT}],
-        max_tokens=128,
+        max_tokens=256,
     ) as stream:
         for event in stream:
             if event.type == "content.delta":
@@ -35,7 +35,11 @@ def run_once(client: OpenAI, model: str, label: str):
                     first_token_at = time.time()
                 n_tokens += 1
                 text.append(event.delta)
-        stream.get_final_completion()
+        # Not calling stream.get_final_completion(): reasoning models (like
+        # this one) can spend the whole max_tokens budget on hidden
+        # "reasoning" content before any visible content, which the SDK's
+        # strict parser treats as a truncation error even though we already
+        # have everything we need (ttft/total/tokens) from the live stream.
 
     t1 = time.time()
     ttft = (first_token_at - t0) if first_token_at else float("nan")
