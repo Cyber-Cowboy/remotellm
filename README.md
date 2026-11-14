@@ -251,6 +251,12 @@ removing one never touches another's downloaded weights):
 - **Stop** deletes that model's endpoint+template (file stays on the
   shared volume, so the next Start doesn't re-download); **Remove** does
   the same and also forgets the model entirely.
+- **Auto-stop:** each model has an optional "stop after N minutes with no
+  requests" setting (at Add time, or later from its expanded row). This is
+  separate from — and on top of — Runpod's own worker-level `idleTimeout`,
+  which only scales the GPU to zero and leaves the endpoint itself sitting
+  there; auto-stop tears the endpoint+template down entirely, the same as
+  a manual Stop, checked by a background loop every 60s. Off by default.
 
 `gpuCount` is fixed at 1 — there's no multi-GPU tensor-split, so a model
 whose estimated VRAM exceeds the biggest single GPU (~180GB, B200) genuinely
