@@ -15,12 +15,15 @@ Run:
 import json
 import logging
 import os
+import re
 import subprocess
+import urllib.parse
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
 logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dashboard")
@@ -38,6 +41,8 @@ RUNPOD_GPU_TYPE_IDS = [g for g in os.environ.get(
 ).split(",") if g]
 
 MODAL_APP_NAME = "gptoss-120b"
+MODAL_MODEL_DIR = "/cache/models/gpt-oss-120b-uncensored"  # must match deploy/modal_deploy.sh
+ENV_FILE = ROOT / ".env"
 
 app = FastAPI(title="GPT-OSS-120B control panel")
 
@@ -50,6 +55,166 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def update_env_file(updates: dict[str, str]) -> None:
+    """Rewrite matching KEY=... lines in .env in place; append any that
+    weren't already there. Keeps every other line untouched."""
+    if not ENV_FILE.exists():
+        return
+    lines = ENV_FILE.read_text().splitlines()
+    seen = set()
+    new_lines = []
+    for line in lines:
+        m = re.match(r"^([A-Z_][A-Z0-9_]*)=", line)
+        if m and m.group(1) in updates:
+            key = m.group(1)
+            new_lines.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            new_lines.append(line)
+    for key, val in updates.items():
+        if key not in seen:
+            new_lines.append(f"{key}={val}")
+    ENV_FILE.write_text("\n".join(new_lines) + "\n")
+
+
+# ----------------------------------------------------------------- Model --
+
+HF_FILE_RE = re.compile(r"huggingface\.co/([^/\s]+/[^/\s]+?)/(?:blob|resolve)/[^/]+/([^\s?]+)")
+HF_REPO_RE = re.compile(r"^(?:https?://(?:www\.)?huggingface\.co/)?([\w.-]+/[\w.-]+?)(?:/tree/.*)?/?$")
+
+
+def parse_hf_input(raw: str) -> tuple[str, str | None]:
+    raw = raw.strip()
+    m = HF_FILE_RE.search(raw)
+    if m:
+        return m.group(1), urllib.parse.unquote(m.group(2))
+    m = HF_REPO_RE.match(raw)
+    if m:
+        return m.group(1), None
+    raise ValueError(f"couldn't parse a Hugging Face repo/file from: {raw!r}")
+
+
+async def find_gguf_file(repo_id: str) -> str:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(f"https://huggingface.co/api/models/{repo_id}")
+        if r.status_code == 404:
+            raise ValueError(f"repo not found on Hugging Face: {repo_id}")
+        r.raise_for_status()
+        siblings = r.json().get("siblings", [])
+    ggufs = [s["rfilename"] for s in siblings if s["rfilename"].lower().endswith(".gguf")]
+    if len(ggufs) == 1:
+        return ggufs[0]
+    if not ggufs:
+        raise ValueError(f"no .gguf files found in {repo_id} (only GGUF models are supported here)")
+    raise ValueError(
+        f"{len(ggufs)} .gguf files found in {repo_id} — paste a direct link to the one you want, e.g. "
+        f"https://huggingface.co/{repo_id}/resolve/main/{ggufs[0]}"
+    )
+
+
+def derive_served_name(repo_id: str) -> str:
+    name = re.sub(r"[^a-z0-9]+", "-", repo_id.split("/")[-1].lower()).strip("-")
+    return name or "custom-model"
+
+
+class ModelUpdateRequest(BaseModel):
+    hf_url: str
+    served_name: str | None = None
+
+
+@app.get("/api/model/current")
+async def model_current():
+    return {
+        "repo": os.environ.get("MODEL_REPO", ""),
+        "file": os.environ.get("MODEL_FILE", ""),
+        "served_name": os.environ.get("SERVED_MODEL_NAME", ""),
+    }
+
+
+@app.post("/api/model/update")
+async def model_update(req: ModelUpdateRequest):
+    try:
+        repo_id, filename = parse_hf_input(req.hf_url)
+        if filename is None:
+            filename = await find_gguf_file(repo_id)
+        elif not filename.lower().endswith(".gguf"):
+            raise ValueError(f"only .gguf files are supported by llama-server here, got: {filename!r}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    resolve_url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        r = await client.head(resolve_url)
+        if r.status_code >= 400:
+            raise HTTPException(
+                status_code=400,
+                detail=f"file not found on Hugging Face ({r.status_code}): {resolve_url}",
+            )
+
+    served_name = req.served_name.strip() if req.served_name and req.served_name.strip() else derive_served_name(repo_id)
+
+    os.environ["MODEL_REPO"] = repo_id
+    os.environ["MODEL_FILE"] = filename
+    os.environ["SERVED_MODEL_NAME"] = served_name
+    update_env_file({"MODEL_REPO": repo_id, "MODEL_FILE": filename, "SERVED_MODEL_NAME": served_name})
+
+    result = {"repo": repo_id, "file": filename, "served_name": served_name,
+              "note": "Existing warm workers won't pick this up until their next cold start "
+                      "(Stop then Start to force it immediately)."}
+
+    state = load_state()
+    template_id = state.get("template_id")
+    if template_id and RUNPOD_API_KEY:
+        async with httpx.AsyncClient(timeout=20) as client:
+            cur = await client.get(
+                f"https://rest.runpod.io/v1/templates/{template_id}",
+                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+            )
+            if cur.status_code >= 400:
+                result["runpod_template_error"] = cur.text
+            else:
+                env = cur.json().get("env", {})
+                env.update({"MODEL_REPO": repo_id, "MODEL_FILE": filename, "SERVED_MODEL_NAME": served_name})
+                patch = await client.patch(
+                    f"https://rest.runpod.io/v1/templates/{template_id}",
+                    headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+                    json={"env": env},
+                )
+                if patch.status_code >= 400:
+                    result["runpod_template_error"] = patch.text
+                else:
+                    result["runpod_template_updated"] = True
+
+    if os.environ.get("MODAL_TOKEN_ID"):
+        cmd = [
+            "python3", "-m", "modal", "secret", "create", "gptoss-worker-secrets",
+            f"SERVED_MODEL_NAME={served_name}",
+            f"MODEL_REPO={repo_id}",
+            f"MODEL_FILE={filename}",
+            f"MODEL_DIR={MODAL_MODEL_DIR}",
+            f"MAX_MODEL_LEN={os.environ.get('MAX_MODEL_LEN', '8192')}",
+            f"N_GPU_LAYERS={os.environ.get('N_GPU_LAYERS', '999')}",
+            f"N_CPU_MOE={os.environ.get('N_CPU_MOE', '0')}",
+            f"MAX_CONCURRENT={os.environ.get('MAX_CONCURRENT', '2')}",
+            f"LLAMA_SERVER_PORT={os.environ.get('LLAMA_SERVER_PORT', '8080')}",
+            f"LLAMA_INTERNAL_API_KEY={os.environ.get('LLAMA_INTERNAL_API_KEY', '')}",
+            f"HF_TOKEN={os.environ.get('HF_TOKEN', '')}",
+            f"PROXY_API_KEY={os.environ.get('PROXY_API_KEY', '')}",
+            f"ALLOWED_ORIGINS={os.environ.get('ALLOWED_ORIGINS', '')}",
+            f"RATE_LIMIT_PER_MINUTE={os.environ.get('RATE_LIMIT_PER_MINUTE', '60')}",
+            f"UPSTREAM_TIMEOUT_SECONDS={os.environ.get('UPSTREAM_TIMEOUT_SECONDS', '600')}",
+            f"LOG_PROMPTS={os.environ.get('LOG_PROMPTS', 'false')}",
+            "--force",
+        ]
+        mresult = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=dict(os.environ), timeout=60)
+        result["modal_secret_updated"] = mresult.returncode == 0
+        if mresult.returncode != 0:
+            result["modal_secret_error"] = (mresult.stderr or mresult.stdout)[-1000:]
+
+    log.warning("Model switched to %s/%s (served as %s)", repo_id, filename, served_name)
+    return result
 
 
 # ---------------------------------------------------------------- Runpod --

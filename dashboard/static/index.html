@@ -56,6 +56,15 @@
   .log.show { display: block; }
   .updated { color: var(--muted); font-size: 11px; margin-top: 18px; text-align: center; }
   .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .model-card { margin-top: 16px; }
+  .field { margin-bottom: 10px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .field input {
+    width: 100%; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: #0e1420; color: var(--text); font-size: 13px;
+  }
+  .field input:focus { outline: none; border-color: var(--accent); }
+  button.primary { border-color: #1f3a5c; color: #8ec3ff; width: 100%; }
 </style>
 </head>
 <body>
@@ -94,6 +103,27 @@
       <div class="log" id="modal-log"></div>
       <div class="note">Modal doesn't expose balance via a simple API — check modal.com/settings/billing.</div>
     </div>
+  </div>
+
+  <div class="card model-card">
+    <div class="card-head">
+      <div class="card-title">Model</div>
+    </div>
+    <div class="rows" id="model-rows">
+      <div class="row"><span class="k">Loading…</span></div>
+    </div>
+    <div class="field">
+      <label for="model-url">Hugging Face link (a direct .gguf file link, or just an org/repo)</label>
+      <input type="text" id="model-url" placeholder="https://huggingface.co/org/repo/resolve/main/model-Q4_K_M.gguf">
+    </div>
+    <div class="field">
+      <label for="model-name">Display name (optional — auto-derived from the repo if left blank)</label>
+      <input type="text" id="model-name" placeholder="my-model">
+    </div>
+    <button class="primary" id="model-update">Update model</button>
+    <div class="log" id="model-log"></div>
+    <div class="note">Updates the Runpod template's env (if an endpoint exists) and the Modal secret (if
+      configured) and .env. Existing warm workers need Stop → Start to actually pick up the new model.</div>
   </div>
 
   <div class="updated" id="updated">—</div>
@@ -197,8 +227,44 @@ wireAction('modal-teardown', '/api/modal/teardown', 'modal-log', refreshModal,
   'Delete the Modal app, its model volume, AND its secrets?\n\nThis removes the downloaded 61GB model — ' +
   'the next Start will need to re-download it and you will need to re-enter secret values. This cannot be undone.');
 
+async function refreshModel() {
+  const rows = document.getElementById('model-rows');
+  try {
+    const s = await fetchJSON('/api/model/current');
+    rows.innerHTML = row('Repo', s.repo || '—') + row('File', s.file || '—') + row('Served as', s.served_name || '—');
+  } catch (e) {
+    rows.innerHTML = row('Error', e.message);
+  }
+}
+
+document.getElementById('model-update').addEventListener('click', async () => {
+  const url = document.getElementById('model-url').value.trim();
+  const servedName = document.getElementById('model-name').value.trim();
+  if (!url) return;
+  if (!window.confirm(`Switch the served model to:\n${url}\n\nThis updates the Runpod template and/or ` +
+      `Modal secret in place. Existing warm workers need Stop → Start to pick it up. Continue?`)) return;
+  const btn = document.getElementById('model-update');
+  const log = document.getElementById('model-log');
+  btn.disabled = true;
+  log.className = 'log show';
+  log.textContent = 'Working…';
+  try {
+    const res = await fetchJSON('/api/model/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hf_url: url, served_name: servedName || null }),
+    });
+    log.textContent = JSON.stringify(res, null, 2);
+    await refreshModel();
+  } catch (e) {
+    log.textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 async function tick() {
-  await Promise.all([refreshRunpod(), refreshModal()]);
+  await Promise.all([refreshRunpod(), refreshModal(), refreshModel()]);
   document.getElementById('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
 }
 
