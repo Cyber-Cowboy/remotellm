@@ -260,6 +260,16 @@ removing one never touches another's downloaded weights):
   **starting**, or stuck idle with a warning, a **Cancel start** button
   replaces Stop — same underlying teardown, just surfaced during the
   window where there's no worker yet to call "running".
+- **Fast start:** next to the normal Start button, races the cheapest
+  `FAST_START_MAX_TIERS` (3) GPU tiers that fit the model at once instead
+  of waiting out one tier at a time — useful when a specific tier's
+  capacity is empty (see above) but another isn't. A background check
+  every `BACKGROUND_CHECK_INTERVAL_SECONDS` (15s) keeps whichever tier
+  gets a worker first and tears the rest down; Cancel start/Stop/Remove
+  all tear down every raced candidate, not just the winner. If more than
+  one tier happens to get capacity around the same time, you're briefly
+  billed for more than one GPU until the next check catches it — the
+  confirmation dialog says so before it starts anything.
 - **Auto-stop:** each model has an optional "stop after N minutes with no
   requests" setting (at Add time, or later from its expanded row). This is
   separate from — and on top of — Runpod's own worker-level `idleTimeout`,
