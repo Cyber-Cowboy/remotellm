@@ -20,6 +20,16 @@ Prereqs (see README.md "Modal deployment"):
     modal token set --token-id ... --token-secret ...
     modal secret create dockerhub-registry-secret REGISTRY_USERNAME=... REGISTRY_PASSWORD=...
     modal secret create gptoss-worker-secrets SERVED_MODEL_NAME=... MODEL_REPO=... ...
+
+Running more than one model side by side (see dashboard/main.py, which
+drives this automatically): set MODAL_APP_SUFFIX to something like
+"-mymodel" and MODAL_WORKER_SECRET_NAME to a secret created for that
+model, then `modal deploy` again — this produces a second, independent
+Modal App (e.g. "gptoss-120b-mymodel") rather than overwriting the first.
+All models still share the registry secret and the model-cache volume
+(each under its own /cache/models/<served_name> subdirectory, set via
+that model's secret's MODEL_DIR), so nothing downloaded is ever
+duplicated or lost when you add or remove a model.
 """
 import os
 import sys
@@ -34,10 +44,13 @@ SCALEDOWN_WINDOW = int(os.environ.get("MODAL_SCALEDOWN_WINDOW_SECONDS", "60"))
 STARTUP_TIMEOUT = int(os.environ.get("MODAL_STARTUP_TIMEOUT_SECONDS", "1800"))  # covers first-ever model download
 VOLUME_NAME = os.environ.get("MODAL_VOLUME_NAME", "gptoss-120b-model-cache")
 
-app = modal.App("gptoss-120b")
+APP_SUFFIX = os.environ.get("MODAL_APP_SUFFIX", "")  # e.g. "-mymodel" for a second/third/... model
+WORKER_SECRET_NAME = os.environ.get("MODAL_WORKER_SECRET_NAME", "gptoss-worker-secrets")
+
+app = modal.App(f"gptoss-120b{APP_SUFFIX}")
 
 registry_secret = modal.Secret.from_name("dockerhub-registry-secret")
-worker_secret = modal.Secret.from_name("gptoss-worker-secrets")
+worker_secret = modal.Secret.from_name(WORKER_SECRET_NAME)
 
 model_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 

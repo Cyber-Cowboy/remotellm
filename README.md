@@ -366,7 +366,7 @@ Prompts are **not** logged by default (`LOG_PROMPTS=false`) on either path;
 flip it to `true` only if you need to debug content and understand the
 privacy implications of doing so.
 
-## 10.1 Control panel (balance, spend, Start/Stop)
+## 10.1 Control panel (multi-model, balance/spend, Start/Stop)
 
 ```bash
 set -a; . ./.env; set +a
@@ -374,15 +374,42 @@ bash scripts/run_dashboard.sh
 # open http://localhost:8787
 ```
 
-A small local dashboard ([`dashboard/`](dashboard/)) showing Runpod account
-balance + live `$/hr` spend and Modal's deploy status side by side, each
-with its own **Start**/**Stop** button — Stop on Runpod deletes the
-endpoint (keeps the network volume + template, so Start recreates it in
-~90s instead of re-downloading the model); Stop on Modal runs `modal app
-stop`. It binds to `127.0.0.1` only and holds `RUNPOD_API_KEY`/
-`MODAL_TOKEN_*` server-side (never sent to the browser) — don't expose it
-beyond localhost without adding real authentication first, since Start/Stop
-spends real money.
+A small local dashboard ([`dashboard/`](dashboard/)) for running **several
+models side by side**, each its own Runpod endpoint or Modal app:
+
+- **Provider accounts:** Runpod's live balance + `$/hr` spend, Modal's
+  configured status, each with a **"Delete everything"** button (nukes
+  every model on that provider plus the shared storage — see below).
+- **Models currently spending money:** the default view shows only models
+  that actually have a GPU running right now (not every model you've ever
+  deployed) — check "Show stopped/idle models too" to see the rest and
+  restart them. Each row has **Stop** (delete that model's endpoint/app;
+  the file stays on the shared volume) and **Remove** (stop + forget it).
+- **Add a model:** paste a Hugging Face link (a direct `.gguf` file link,
+  or just `org/repo` if it has exactly one GGUF), pick a provider, and
+  **"Check model & recommend hardware"** fetches the file's real size from
+  HF, estimates the VRAM it needs, and shows every GPU tier your chosen
+  provider offers with its real `$/hr` price — pre-selecting the cheapest
+  one that fits. Pick a different tier if you want, then **Deploy**.
+
+All models on a provider share one network volume / Modal volume (each
+model gets its own subfolder, named after its "served name"), so adding or
+removing one model never re-downloads another's weights. `gpuCount` is
+fixed at 1 everywhere — there's no multi-GPU tensor-split, so a model whose
+estimated VRAM exceeds the biggest single GPU (~180GB, B200) genuinely
+doesn't fit; the recommendation flags this rather than guessing.
+
+**Known quirk, found while building this:** Runpod's cheaper/smaller GPU
+tiers (tested: RTX A4000) can sit in `IN_QUEUE` indefinitely with zero
+workers ever provisioning if that tier has no capacity in your data
+center — the API accepts the request but nothing happens. If a model you
+just added never starts, try a bigger/more common tier (A100/H100 are
+reliably available) rather than assuming something's broken.
+
+It binds to `127.0.0.1` only and holds `RUNPOD_API_KEY`/`MODAL_TOKEN_*`
+server-side (never sent to the browser) — don't expose it beyond localhost
+without adding real authentication first, since every Add/Start/Stop
+button here spends or stops real money.
 
 ## 11. Updating the model
 
