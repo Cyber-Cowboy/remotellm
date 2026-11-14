@@ -45,7 +45,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/build/bin/llama-server /usr/local/bin/llama-server
+# llama-server is dynamically linked against sibling .so files built right
+# next to it (libllama-server-impl.so, libggml*.so, ...) via an $ORIGIN
+# rpath — copying only the executable leaves it unable to start at all
+# ("error while loading shared libraries: libllama-server-impl.so: cannot
+# open shared object file"). Copy the whole build/bin/ directory so every
+# sibling library lands alongside it.
+COPY --from=builder /build/build/bin/ /usr/local/bin/
 
 WORKDIR /app
 COPY requirements.txt .
