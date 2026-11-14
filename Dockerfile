@@ -51,7 +51,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-COPY src/handler.py .
+COPY src/handler.py src/llama_runtime.py src/modal_gateway.py .
 
 # Defaults; override at endpoint/template creation time via env vars.
 ENV MODEL_REPO=HauhauCS/GPTOSS-120B-Uncensored-HauhauCS-Aggressive \

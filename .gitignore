@@ -1,4 +1,5 @@
 .env
+deploy/infra_state.json
 *.gguf
 *.log
 __pycache__/

@@ -60,6 +60,8 @@ def main():
     p.add_argument("--idle-timeout", type=int, default=60)
     p.add_argument("--workers-max", type=int, default=1)
     p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
+    p.add_argument("--registry-username", default=os.environ.get("DOCKERHUB_USERNAME", ""))
+    p.add_argument("--registry-password", default=os.environ.get("DOCKERHUB_TOKEN", ""))
     args = p.parse_args()
 
     api_key = os.environ.get("RUNPOD_API_KEY")
@@ -68,13 +70,28 @@ def main():
 
     state = load_state()
 
+    # 0. Container registry auth (required for private Docker Hub repos)
+    if "registry_auth_id" in state:
+        print(f"reusing existing container registry auth {state['registry_auth_id']}")
+    elif args.registry_username and args.registry_password:
+        reg = api("POST", "/containerregistryauth", api_key, json={
+            "name": f"{args.name}-dockerhub",
+            "username": args.registry_username,
+            "password": args.registry_password,
+        })
+        state["registry_auth_id"] = reg["id"]
+        save_state(state)
+        print(f"created container registry auth {reg['id']}")
+    else:
+        print("no registry credentials given; assuming the image is public")
+
     # 1. Network volume
     if "network_volume_id" in state:
         print(f"reusing existing network volume {state['network_volume_id']}")
     else:
-        vol = api("POST", "/network-volumes", api_key, json={
+        vol = api("POST", "/networkvolumes", api_key, json={
             "name": f"{args.name}-model-storage",
-            "dataCenter": args.data_center,
+            "dataCenterId": args.data_center,
             "size": args.volume_size_gb,
         })
         state["network_volume_id"] = vol["id"]
@@ -98,7 +115,7 @@ def main():
     if "template_id" in state:
         print(f"reusing existing template {state['template_id']}")
     else:
-        tmpl = api("POST", "/templates", api_key, json={
+        tmpl_body = {
             "name": f"{args.name}-template",
             "imageName": args.image,
             "category": "NVIDIA",
@@ -106,7 +123,10 @@ def main():
             "containerDiskInGb": 20,  # image itself is small; the model lives on the network volume
             "ports": ["8080/http"],
             "env": env,
-        })
+        }
+        if "registry_auth_id" in state:
+            tmpl_body["containerRegistryAuthId"] = state["registry_auth_id"]
+        tmpl = api("POST", "/templates", api_key, json=tmpl_body)
         state["template_id"] = tmpl["id"]
         save_state(state)
         print(f"created template {tmpl['id']}")
