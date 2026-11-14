@@ -261,8 +261,9 @@ removing one never touches another's downloaded weights):
   replaces Stop — same underlying teardown, just surfaced during the
   window where there's no worker yet to call "running".
 - **Fast start:** next to the normal Start button, races the cheapest
-  `FAST_START_MAX_TIERS` (3) GPU tiers that fit the model at once instead
-  of waiting out one tier at a time — useful when a specific tier's
+  `FAST_START_MAX_TIERS` (10 — effectively every distinct tier right now)
+  GPU tiers that fit the model at once instead of waiting out one tier
+  at a time — useful when a specific tier's
   capacity is empty (see above) but another isn't. A background check
   every `BACKGROUND_CHECK_INTERVAL_SECONDS` (15s) keeps whichever tier
   gets a worker first and tears the rest down; Cancel start/Stop/Remove

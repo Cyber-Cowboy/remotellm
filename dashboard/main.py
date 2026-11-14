@@ -308,8 +308,10 @@ async def gpu_options_with_stock(required_gb: float | None) -> dict:
     return result
 
 
-FAST_START_MAX_TIERS = 3  # cap simultaneous endpoints — more tiers means more
-# risk of briefly paying for more than one GPU before the race is settled
+FAST_START_MAX_TIERS = 10  # cap simultaneous endpoints — more tiers means more
+# risk of briefly paying for more than one GPU before the race is settled.
+# There are only 9 distinct (vram, price) tiers in RUNPOD_GPU_CATALOG right
+# now, so 10 effectively means "race every tier that fits".
 
 
 def fast_start_tiers_for(required_gb: float | None, max_tiers: int = FAST_START_MAX_TIERS) -> list[str]:

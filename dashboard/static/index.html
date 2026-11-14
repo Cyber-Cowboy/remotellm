@@ -215,7 +215,7 @@ wireAction('runpod-teardown', '/api/runpod/teardown', 'runpod-log', refreshAll,
 let showAll = false;
 let expandedModels = new Set();
 let gpuOptionsCache = {};  // model id -> gpu-options response
-const FAST_START_MAX_TIERS = 3;  // keep in sync with dashboard/main.py's FAST_START_MAX_TIERS
+const FAST_START_MAX_TIERS = 10;  // keep in sync with dashboard/main.py's FAST_START_MAX_TIERS
 document.getElementById('show-all-toggle').addEventListener('change', (e) => {
   showAll = e.target.checked;
   refreshModels();
