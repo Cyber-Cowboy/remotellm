@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPT-OSS-120B control panel</title>
+<style>
+  :root {
+    --bg: #0b0f14; --card: #121824; --border: #232c3a; --text: #e6edf3;
+    --muted: #8b98a9; --green: #3fb950; --red: #f85149; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px 16px;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px;
+  }
+  .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .card-title { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.off { background: var(--muted); }
+  .dot.err { background: var(--red); }
+  .rows { display: flex; flex-direction: column; gap: 10px; margin-bottom: 18px; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; }
+  .row .k { color: var(--muted); }
+  .row .v { font-variant-numeric: tabular-nums; font-weight: 500; }
+  .actions { display: flex; gap: 10px; }
+  button {
+    flex: 1; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: #1c2432; color: var(--text); font-size: 13px; font-weight: 600;
+    cursor: pointer; transition: opacity .15s;
+  }
+  button:hover { opacity: 0.85; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.stop { border-color: #5c2328; color: #ffb4ac; }
+  button.start { border-color: #1f4f2b; color: #9fe6ad; }
+  .log {
+    margin-top: 12px; font-size: 11px; color: var(--muted); white-space: pre-wrap;
+    max-height: 120px; overflow-y: auto; background: #0e1420; border-radius: 6px;
+    padding: 8px; display: none;
+  }
+  .log.show { display: block; }
+  .updated { color: var(--muted); font-size: 11px; margin-top: 18px; text-align: center; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>GPT-OSS-120B control panel</h1>
+  <div class="sub">Local only — holds API keys server-side. See .env for credentials.</div>
+
+  <div class="grid">
+    <div class="card" id="runpod-card">
+      <div class="card-head">
+        <div class="card-title"><span class="dot" id="runpod-dot"></span> Runpod</div>
+      </div>
+      <div class="rows" id="runpod-rows">
+        <div class="row"><span class="k">Loading…</span></div>
+      </div>
+      <div class="actions">
+        <button class="start" id="runpod-start">Start</button>
+        <button class="stop" id="runpod-stop">Stop</button>
+      </div>
+      <div class="log" id="runpod-log"></div>
+    </div>
+
+    <div class="card" id="modal-card">
+      <div class="card-head">
+        <div class="card-title"><span class="dot" id="modal-dot"></span> Modal</div>
+      </div>
+      <div class="rows" id="modal-rows">
+        <div class="row"><span class="k">Loading…</span></div>
+      </div>
+      <div class="actions">
+        <button class="start" id="modal-start">Start</button>
+        <button class="stop" id="modal-stop">Stop</button>
+      </div>
+      <div class="log" id="modal-log"></div>
+      <div class="note">Modal doesn't expose balance via a simple API — check modal.com/settings/billing.</div>
+    </div>
+  </div>
+
+  <div class="updated" id="updated">—</div>
+</div>
+
+<script>
+const fmtMoney = (n) => (n === null || n === undefined || Number.isNaN(n)) ? '—' : '$' + Number(n).toFixed(4);
+const fmtMoney2 = (n) => (n === null || n === undefined || Number.isNaN(n)) ? '—' : '$' + Number(n).toFixed(2);
+
+function row(k, v) {
+  return `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+}
+
+async function fetchJSON(url, opts) {
+  const r = await fetch(url, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+
+async function refreshRunpod() {
+  const dot = document.getElementById('runpod-dot');
+  const rows = document.getElementById('runpod-rows');
+  try {
+    const s = await fetchJSON('/api/runpod/status');
+    if (!s.configured) {
+      rows.innerHTML = row('Status', 'not configured (no RUNPOD_API_KEY)');
+      dot.className = 'dot off';
+      return;
+    }
+    const bal = s.account && s.account.clientBalance;
+    const spend = s.account && s.account.currentSpendPerHr;
+    dot.className = 'dot ' + (s.deployed ? 'on' : 'off');
+    let html = row('Balance', fmtMoney2(bal)) + row('Spend', fmtMoney(spend) + '/hr');
+    if (s.deployed) {
+      html += row('Endpoint', s.endpoint_id);
+      if (s.workers) {
+        html += row('Workers', `${s.workers.total} total (${s.workers.running} running, ${s.workers.idle} idle)`);
+      }
+    } else {
+      html += row('Endpoint', 'none (stopped)');
+    }
+    rows.innerHTML = html;
+  } catch (e) {
+    rows.innerHTML = row('Error', e.message);
+    dot.className = 'dot err';
+  }
+}
+
+async function refreshModal() {
+  const dot = document.getElementById('modal-dot');
+  const rows = document.getElementById('modal-rows');
+  try {
+    const s = await fetchJSON('/api/modal/status');
+    if (!s.configured) {
+      rows.innerHTML = row('Status', 'not configured (no MODAL_TOKEN_ID)');
+      dot.className = 'dot off';
+      return;
+    }
+    if (s.error) {
+      rows.innerHTML = row('Error', s.error);
+      dot.className = 'dot err';
+      return;
+    }
+    dot.className = 'dot ' + (s.deployed ? 'on' : 'off');
+    rows.innerHTML = row('App', 'gptoss-120b') + row('Status', s.deployed ? 'deployed' : 'stopped');
+  } catch (e) {
+    rows.innerHTML = row('Error', e.message);
+    dot.className = 'dot err';
+  }
+}
+
+function wireAction(btnId, url, logId, onDone) {
+  document.getElementById(btnId).addEventListener('click', async () => {
+    const btn = document.getElementById(btnId);
+    const log = document.getElementById(logId);
+    btn.disabled = true;
+    log.className = 'log show';
+    log.textContent = 'Working…';
+    try {
+      const res = await fetchJSON(url, { method: 'POST' });
+      log.textContent = JSON.stringify(res, null, 2);
+    } catch (e) {
+      log.textContent = 'Error: ' + e.message;
+    } finally {
+      btn.disabled = false;
+      onDone();
+    }
+  });
+}
+
+wireAction('runpod-stop', '/api/runpod/stop', 'runpod-log', refreshRunpod);
+wireAction('runpod-start', '/api/runpod/start', 'runpod-log', refreshRunpod);
+wireAction('modal-stop', '/api/modal/stop', 'modal-log', refreshModal);
+wireAction('modal-start', '/api/modal/start', 'modal-log', refreshModal);
+
+async function tick() {
+  await Promise.all([refreshRunpod(), refreshModal()]);
+  document.getElementById('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+tick();
+setInterval(tick, 10000);
+</script>
+</body>
+</html>

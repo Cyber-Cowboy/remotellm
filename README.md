@@ -135,7 +135,11 @@ Both providers only bill for the seconds a container is actually running
 │   ├── main.py
 │   ├── requirements.txt
 │   └── Dockerfile
+├── dashboard/                    # local control panel: balance/spend + Start/Stop (see §10.1)
+│   ├── main.py
+│   └── static/index.html
 ├── scripts/
+│   ├── run_dashboard.sh         # launches dashboard/ on http://localhost:8787
 │   ├── run_proxy_local.sh       # runs proxy/ locally with uvicorn (no Docker) for PROVIDER=runpod testing
 │   ├── print_base_url.sh        # prints the right base_url for the active PROVIDER
 │   ├── download_model.sh        # Runpod: optional pre-warm of the network volume
@@ -361,6 +365,24 @@ Reports cold vs warm total latency, time-to-first-token, and tokens/sec.
 Prompts are **not** logged by default (`LOG_PROMPTS=false`) on either path;
 flip it to `true` only if you need to debug content and understand the
 privacy implications of doing so.
+
+## 10.1 Control panel (balance, spend, Start/Stop)
+
+```bash
+set -a; . ./.env; set +a
+bash scripts/run_dashboard.sh
+# open http://localhost:8787
+```
+
+A small local dashboard ([`dashboard/`](dashboard/)) showing Runpod account
+balance + live `$/hr` spend and Modal's deploy status side by side, each
+with its own **Start**/**Stop** button — Stop on Runpod deletes the
+endpoint (keeps the network volume + template, so Start recreates it in
+~90s instead of re-downloading the model); Stop on Modal runs `modal app
+stop`. It binds to `127.0.0.1` only and holds `RUNPOD_API_KEY`/
+`MODAL_TOKEN_*` server-side (never sent to the browser) — don't expose it
+beyond localhost without adding real authentication first, since Start/Stop
+spends real money.
 
 ## 11. Updating the model
 
