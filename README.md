@@ -234,7 +234,13 @@ removing one never touches another's downloaded weights):
   `config.json`, but the GGUF metadata is always there), then shows every
   Runpod GPU tier with its real `$/hr` price, pre-selecting the cheapest
   one that fits. Pick a different tier if you want, optionally override
-  the context window, then **Deploy**.
+  the context window, then **Deploy**. Next to the picker, a color-coded
+  line shows each tier's current Runpod stock status (High/Medium/Low) —
+  this is Runpod's global signal, not scoped to `RUNPOD_DATA_CENTER`;
+  Runpod's API accepts a `dataCenterId` filter on this field but always
+  returns `null` for it regardless of the id given, so no real
+  per-region breakdown is available. Still useful as an early warning
+  before picking a tier that's likely to sit `IN_QUEUE` (see §6).
 - **Click any model row** to expand it. A model with no live endpoint shows
   a **GPU picker with price** and a **Start** button right there — starting
   (or restarting after Stop) a model always means choosing hardware

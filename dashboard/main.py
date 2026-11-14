@@ -300,6 +300,14 @@ def gpu_options_for(required_gb: float | None) -> dict:
     return {"options": options, "recommended_id": recommended_id, "fits_any": fits_any}
 
 
+async def gpu_options_with_stock(required_gb: float | None) -> dict:
+    result = gpu_options_for(required_gb)
+    stock = await runpod_gpu_stock()
+    for opt in result["options"]:
+        opt["stock_status"] = stock.get(opt["id"])
+    return result
+
+
 # A few more real Runpod enum values at the same VRAM tier *and* price as
 # something in RUNPOD_GPU_CATALOG, not listed there separately, but worth
 # trying as fallbacks too — same reasoning as the catalog-derived groups
@@ -358,7 +366,7 @@ async def models_resolve(req: ResolveRequest):
         "estimated_vram_gb": round(required_gb, 1) if required_gb else None,
         "recommended_context_window": ctx,
         "recommended_max_tokens": max_tokens,
-        **gpu_options_for(required_gb),
+        **(await gpu_options_with_stock(required_gb)),
     }
 
 
@@ -375,6 +383,41 @@ async def runpod_account() -> dict:
         )
         r.raise_for_status()
         return r.json()["data"]["myself"]
+
+
+_gpu_stock_cache: dict = {"at": 0.0, "data": {}}
+GPU_STOCK_CACHE_SECONDS = 30
+
+
+async def runpod_gpu_stock() -> dict[str, str | None]:
+    """Runpod's own "High"/"Medium"/"Low" stock signal per GPU id, from the
+    same GraphQL field used to diagnose real capacity shortages during
+    development (see README "Known limitations"). There's no working
+    per-data-center breakdown — passing dataCenterId to lowestPrice makes
+    stockStatus come back null instead of filtered, confirmed by hand — so
+    this is Runpod's global figure, the best available proxy for "will
+    this GPU actually start", not specific to RUNPOD_DATA_CENTER."""
+    now = time.time()
+    if now - _gpu_stock_cache["at"] < GPU_STOCK_CACHE_SECONDS and _gpu_stock_cache["data"]:
+        return _gpu_stock_cache["data"]
+    if not RUNPOD_API_KEY:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://api.runpod.io/graphql",
+                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+                json={"query": "query { gpuTypes { id lowestPrice(input:{gpuCount:1}){ stockStatus } } }"},
+            )
+            r.raise_for_status()
+            rows = r.json()["data"]["gpuTypes"]
+    except Exception as e:
+        log.warning("couldn't fetch GPU stock status: %s", e)
+        return _gpu_stock_cache["data"]
+    data = {row["id"]: (row.get("lowestPrice") or {}).get("stockStatus") for row in rows}
+    _gpu_stock_cache["at"] = now
+    _gpu_stock_cache["data"] = data
+    return data
 
 
 async def runpod_workers(endpoint_id: str) -> dict | None:
@@ -685,7 +728,7 @@ async def models_gpu_options(model_id: str):
             required_gb = round(size_bytes / 1e9 * 1.15 + 2, 1)
             m["estimated_vram_gb"] = required_gb
             save_models(models)
-    return {"estimated_vram_gb": required_gb, **gpu_options_for(required_gb)}
+    return {"estimated_vram_gb": required_gb, **(await gpu_options_with_stock(required_gb))}
 
 
 @app.post("/api/models")

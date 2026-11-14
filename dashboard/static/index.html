@@ -125,6 +125,7 @@
         <label for="add-gpu">GPU (pick one — price shown per hour while running)</label>
         <select id="add-gpu"></select>
       </div>
+      <div id="add-gpu-stock"></div>
       <div class="field">
         <label for="add-ctx">Context window</label>
         <input type="number" id="add-ctx" placeholder="8192">
@@ -223,18 +224,40 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+function stockLabel(status) {
+  if (!status) return '';
+  return ` — stock: ${status}`;
+}
+
+function stockDotColor(status) {
+  if (status === 'High') return '#3ddc84';
+  if (status === 'Medium') return '#e3b341';
+  if (status === 'Low') return '#f0506e';
+  return '#555';
+}
+
 function gpuSelectHtml(idPrefix, modelId, data) {
   if (!data) return `<div class="note">Loading GPU options…</div>`;
   const opts = data.options.map(o =>
     `<option value="${o.id}" ${o.id === data.recommended_id ? 'selected' : ''}>` +
-    `${o.id} — ${o.vram_gb}GB — ${fmtMoney2(o.price_hr)}/hr${o.fits ? '' : ' (too small)'}</option>`
+    `${o.id} — ${o.vram_gb}GB — ${fmtMoney2(o.price_hr)}/hr${o.fits ? '' : ' (too small)'}${stockLabel(o.stock_status)}</option>`
   ).join('');
   return `
     <div class="field">
       <label for="${idPrefix}-gpu-${modelId}">GPU (price shown per hour while running)</label>
       <select id="${idPrefix}-gpu-${modelId}">${opts}</select>
     </div>
+    ${gpuStockLegendHtml(data.options)}
     ${!data.fits_any ? `<div class="note">Doesn't fit any single GPU — would need multi-GPU tensor-split (not implemented).</div>` : ''}`;
+}
+
+function gpuStockLegendHtml(options) {
+  const rows = options.map(o =>
+    `<span style="display:inline-flex;align-items:center;gap:4px;margin:2px 10px 2px 0">` +
+    `<span style="width:8px;height:8px;border-radius:50%;background:${stockDotColor(o.stock_status)};display:inline-block"></span>` +
+    `${o.id.replace('NVIDIA ', '')}: ${o.stock_status || 'unknown'}</span>`
+  ).join('');
+  return `<div class="note" style="margin-top:6px">Runpod availability (global, not specific to one data center):<br>${rows}</div>`;
 }
 
 function connectionPanelHtml(m) {
@@ -434,8 +457,9 @@ function renderGpuOptions(options, recommendedId) {
   const sel = document.getElementById('add-gpu');
   sel.innerHTML = options.map(o =>
     `<option value="${o.id}" ${o.id === recommendedId ? 'selected' : ''}>` +
-    `${o.id} — ${o.vram_gb}GB — ${fmtMoney2(o.price_hr)}/hr${o.fits ? '' : ' (too small)'}</option>`
+    `${o.id} — ${o.vram_gb}GB — ${fmtMoney2(o.price_hr)}/hr${o.fits ? '' : ' (too small)'}${stockLabel(o.stock_status)}</option>`
   ).join('');
+  document.getElementById('add-gpu-stock').innerHTML = gpuStockLegendHtml(options);
 }
 
 document.getElementById('add-resolve').addEventListener('click', async () => {
