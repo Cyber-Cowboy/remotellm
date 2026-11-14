@@ -22,6 +22,7 @@ import re
 import subprocess
 import time
 import urllib.parse
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -35,6 +36,8 @@ from slowapi.util import get_remote_address
 
 logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dashboard")
+
+AUTO_STOP_CHECK_INTERVAL_SECONDS = 60
 
 ROOT = Path(__file__).parent.parent
 STATE_FILE = ROOT / "deploy" / "infra_state.json"   # shared Runpod resources only (registry auth, volume)
@@ -50,7 +53,14 @@ PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 RATE_LIMIT_PER_MINUTE = os.environ.get("RATE_LIMIT_PER_MINUTE", "60")
 ALLOWED_ORIGINS = [o for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o]
 
-app = FastAPI(title="GPT-OSS control panel")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_auto_stop_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="GPT-OSS control panel", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -494,6 +504,42 @@ async def runpod_delete_model(m: dict) -> None:
                 )
 
 
+async def _check_auto_stop() -> None:
+    """Per-model auto-stop: deletes that model's endpoint+template (same
+    as a manual Stop) once `auto_stop_minutes` have passed since its last
+    request — independent of Runpod's own worker-level idleTimeout, which
+    only scales the GPU to zero and leaves the endpoint itself sitting
+    there. Measured from the last real request if there's been one, else
+    from when it was last started, so a model nobody ever used doesn't
+    linger forever but also isn't killed before anyone got to try it."""
+    models = load_models()
+    changed = False
+    for m in models:
+        minutes = m.get("auto_stop_minutes")
+        if not minutes:
+            continue
+        if not (m.get("runpod") or {}).get("endpoint_id"):
+            continue
+        reference = m.get("last_request_at") or m.get("last_start_attempt") or m.get("created_at")
+        if not reference or time.time() - reference < minutes * 60:
+            continue
+        log.warning("Auto-stopping model %s after %s min with no requests", m["id"], minutes)
+        await runpod_delete_model(m)
+        m["runpod"] = {}
+        changed = True
+    if changed:
+        save_models(models)
+
+
+async def _auto_stop_loop() -> None:
+    while True:
+        try:
+            await _check_auto_stop()
+        except Exception as e:  # noqa: BLE001 — one bad check must not kill the loop
+            log.warning("auto-stop check failed: %s", e)
+        await asyncio.sleep(AUTO_STOP_CHECK_INTERVAL_SECONDS)
+
+
 @app.get("/api/runpod/status")
 async def runpod_status():
     account = await runpod_account()
@@ -539,10 +585,15 @@ class AddModelRequest(BaseModel):
     gpu_id: str
     served_name: str | None = None
     context_window: int | None = None
+    auto_stop_minutes: int | None = None
 
 
 class StartModelRequest(BaseModel):
     gpu_id: str | None = None
+
+
+class AutoStopRequest(BaseModel):
+    minutes: int | None = None  # null/0 disables it
 
 
 STUCK_WARNING_AFTER_SECONDS = 180  # how long "0 workers since Start" is normal cold-start wait vs. likely stuck
@@ -654,6 +705,7 @@ async def models_add(req: AddModelRequest):
         "estimated_vram_gb": round(size_bytes / 1e9 * 1.15 + 2, 1) if size_bytes else None,
         "recommended_context_window": ctx,
         "recommended_max_tokens": default_max_tokens,
+        "auto_stop_minutes": req.auto_stop_minutes,
         "created_at": time.time(),
     }
     entry["runpod"] = await runpod_create_model(served_name, repo_id, filename,
@@ -726,6 +778,18 @@ async def models_start(model_id: str, req: StartModelRequest | None = None):
                     "have no capacity right now — try Start again with a different GPU."}
 
 
+@app.post("/api/models/{model_id}/auto-stop")
+async def models_set_auto_stop(model_id: str, req: AutoStopRequest):
+    models = load_models()
+    m = next((x for x in models if x["id"] == model_id), None)
+    if not m:
+        raise HTTPException(status_code=404, detail="model not found")
+    m["auto_stop_minutes"] = req.minutes or None
+    save_models(models)
+    log.warning("Set auto_stop_minutes=%s for model %s", m["auto_stop_minutes"], model_id)
+    return {"auto_stop_minutes": m["auto_stop_minutes"]}
+
+
 @app.delete("/api/models/{model_id}")
 async def models_remove(model_id: str):
     models = load_models()
@@ -771,13 +835,6 @@ def check_gateway_auth(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="missing bearer token")
     if authorization[len("Bearer "):] != PROXY_API_KEY:
         raise HTTPException(status_code=401, detail="invalid api key")
-
-
-def find_model_by_served_name(served_name: str) -> dict | None:
-    for m in load_models():
-        if m["served_name"] == served_name:
-            return m
-    return None
 
 
 async def _runpod_job(endpoint_id: str, route: str, body: dict):
@@ -841,12 +898,15 @@ async def _gateway_dispatch(route: str, body: dict):
     served_name = body.get("model")
     if not served_name:
         raise HTTPException(status_code=400, detail="missing 'model' in request body")
-    m = find_model_by_served_name(served_name)
+    models = load_models()
+    m = next((x for x in models if x["served_name"] == served_name), None)
     if not m:
         raise HTTPException(status_code=404, detail=f"no model named {served_name!r} is tracked by this panel")
     endpoint_id = (m.get("runpod") or {}).get("endpoint_id")
     if not endpoint_id:
         raise HTTPException(status_code=409, detail=f"model {served_name!r} is stopped — Start it first")
+    m["last_request_at"] = time.time()  # resets the auto-stop clock, see _check_auto_stop
+    save_models(models)
     return await _runpod_job(endpoint_id, route, body)
 
 

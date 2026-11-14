@@ -131,6 +131,10 @@
         <label for="add-name">Display name (optional — auto-derived from the repo if left blank)</label>
         <input type="text" id="add-name" placeholder="my-model">
       </div>
+      <div class="field">
+        <label for="add-autostop">Auto-stop after N minutes with no requests (blank = never)</label>
+        <input type="number" id="add-autostop" placeholder="e.g. 30">
+      </div>
       <button class="start" style="width:100%" id="add-deploy">Deploy this model</button>
     </div>
     <div class="log" id="add-log"></div>
@@ -254,6 +258,13 @@ function connectionPanelHtml(m) {
       ${startSection}
       <div class="row"><span class="k">Context window</span><span class="v">${fmtNum(m.recommended_context_window)}</span></div>
       <div class="row"><span class="k">Max tokens (suggested)</span><span class="v">${fmtNum(m.recommended_max_tokens)}</span></div>
+      <div class="field" style="margin-top:10px">
+        <label for="autostop-${m.id}">Auto-stop after N minutes with no requests (blank = never)</label>
+        <div style="display:flex; gap:8px">
+          <input type="number" id="autostop-${m.id}" value="${m.auto_stop_minutes ?? ''}" placeholder="e.g. 30" style="flex:1">
+          <button data-action="save-autostop" data-id="${m.id}">Save</button>
+        </div>
+      </div>
       ${c.ready ? `
       <div class="row"><span class="k">Base URL</span><span class="v">${c.base_url}</span></div>
       <div class="row"><span class="k">Model</span><span class="v">${m.served_name}</span></div>
@@ -357,6 +368,14 @@ document.getElementById('models-list').addEventListener('click', async (e) => {
         body: JSON.stringify({ gpu_id: gpuId }),
       });
     }
+    if (action === 'save-autostop') {
+      const input = document.getElementById(`autostop-${id}`);
+      const minutes = input && input.value.trim() ? parseInt(input.value.trim(), 10) : null;
+      await fetchJSON(`/api/models/${encodeURIComponent(id)}/auto-stop`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ minutes }),
+      });
+    }
     if (action === 'stop') await fetchJSON(`/api/models/${encodeURIComponent(id)}/stop`, { method: 'POST' });
     if (action === 'remove') {
       delete gpuOptionsCache[id];
@@ -428,6 +447,7 @@ document.getElementById('add-deploy').addEventListener('click', async () => {
   const gpuId = document.getElementById('add-gpu').value;
   const servedName = document.getElementById('add-name').value.trim();
   const ctx = document.getElementById('add-ctx').value.trim();
+  const autoStop = document.getElementById('add-autostop').value.trim();
   if (!window.confirm(`Deploy ${resolved.repo}/${resolved.file} on ${gpuId}?\n\n` +
       `This starts billing as soon as the first request arrives, and keeps a model-cache volume costing ` +
       `storage even when idle. Continue?`)) return;
@@ -445,11 +465,13 @@ document.getElementById('add-deploy').addEventListener('click', async () => {
         gpu_id: gpuId,
         served_name: servedName || null,
         context_window: ctx ? parseInt(ctx, 10) : null,
+        auto_stop_minutes: autoStop ? parseInt(autoStop, 10) : null,
       }),
     });
     log.textContent = JSON.stringify(res, null, 2);
     document.getElementById('add-resolved').classList.add('hidden');
     document.getElementById('add-url').value = '';
+    document.getElementById('add-autostop').value = '';
     resolved = null;
     await refreshModels();
   } catch (e) {
