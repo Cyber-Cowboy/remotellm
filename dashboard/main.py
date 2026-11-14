@@ -14,6 +14,7 @@ Run:
     bash scripts/run_dashboard.sh
     # open http://localhost:8787
 """
+import asyncio
 import json
 import logging
 import os
@@ -24,9 +25,13 @@ import urllib.parse
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dashboard")
@@ -41,8 +46,21 @@ DOCKERHUB_USERNAME = os.environ.get("DOCKERHUB_USERNAME", "")
 RUNPOD_DATA_CENTER = os.environ.get("RUNPOD_DATA_CENTER", "US-CA-2")
 RUNPOD_NETWORK_VOLUME_SIZE_GB = os.environ.get("RUNPOD_NETWORK_VOLUME_SIZE_GB", "100")
 RUNPOD_IDLE_TIMEOUT_SECONDS = int(os.environ.get("MODEL_IDLE_TIMEOUT_SECONDS", "60"))
+PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
+RATE_LIMIT_PER_MINUTE = os.environ.get("RATE_LIMIT_PER_MINUTE", "60")
+ALLOWED_ORIGINS = [o for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o]
 
 app = FastAPI(title="GPT-OSS control panel")
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 
 # ------------------------------------------------------------- storage --
@@ -246,6 +264,27 @@ def gpu_price(provider: str, gpu_id: str) -> float | None:
     return None
 
 
+# Runpod SKUs at the same VRAM tier are mostly interchangeable (PCIe vs.
+# SXM, or just the same card sold at two price points) — Runpod's own
+# capacity varies by SKU within a data center, and a deploy with only one
+# GPU id can sit at zero workers forever if that exact SKU has none
+# available right now (found by hand: RTX A4000 did this; so did A100
+# 80GB PCIe alone, once). Passing every same-tier id as a fallback list
+# costs nothing (Runpod bills whichever one it actually schedules) and
+# makes that failure mode much less likely.
+_RUNPOD_TIER_GROUPS = [
+    ["NVIDIA A100 80GB PCIe", "NVIDIA A100-SXM4-80GB"],
+    ["NVIDIA H100 PCIe", "NVIDIA H100 80GB HBM3"],
+]
+
+
+def runpod_gpu_ids_for(gpu_id: str) -> list[str]:
+    for group in _RUNPOD_TIER_GROUPS:
+        if gpu_id in group:
+            return group
+    return [gpu_id]
+
+
 class ResolveRequest(BaseModel):
     hf_url: str
     provider: str
@@ -368,6 +407,33 @@ async def runpod_create_model(served_name: str, repo: str, filename: str, gpu_id
             raise HTTPException(status_code=502, detail=f"endpoint create failed: {ep.text}")
         endpoint_id = ep.json()["id"]
     return {"template_id": template_id, "endpoint_id": endpoint_id}
+
+
+async def _warm_runpod(endpoint_id: str, served_name: str) -> None:
+    """Runpod only spins up a worker in response to an actual job — an
+    endpoint existing isn't enough. Fire a trivial job so Start actually
+    starts something, instead of silently doing nothing when the endpoint
+    was already there but idle/scaled-to-zero."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.runpod.ai/v2/{endpoint_id}/run",
+                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"},
+                json={"input": {"route": "/v1/chat/completions",
+                                "payload": {"model": served_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}}},
+            )
+    except Exception as e:  # noqa: BLE001 — best-effort warm-up, never fail the request over it
+        log.warning("warm-up request to Runpod endpoint %s failed: %s", endpoint_id, e)
+
+
+async def _warm_modal(web_url: str) -> None:
+    """Same idea for Modal: an app being deployed doesn't mean a container
+    is running — only real traffic to its URL triggers a cold start."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.get(f"{web_url}/health")
+    except Exception as e:  # noqa: BLE001
+        log.warning("warm-up request to Modal app %s failed: %s", web_url, e)
 
 
 async def runpod_delete_model(m: dict) -> None:
@@ -582,7 +648,7 @@ async def models_list(all: bool = False):
     for m in models:
         status = await model_live_status(m)
         if all or status["spending"]:
-            out.append({**m, "status": status})
+            out.append({**m, "status": status, "connection": model_connection_info(m)})
     return {"models": out, "total_tracked": len(models)}
 
 
@@ -610,7 +676,7 @@ async def models_add(req: AddModelRequest):
         "created_at": time.time(),
     }
     if req.provider == "runpod":
-        entry["runpod"] = await runpod_create_model(served_name, repo_id, filename, [req.gpu_id])
+        entry["runpod"] = await runpod_create_model(served_name, repo_id, filename, runpod_gpu_ids_for(req.gpu_id))
     else:
         entry["modal"] = await modal_create_model(served_name, repo_id, filename, req.gpu_id)
 
@@ -642,22 +708,36 @@ async def models_stop(model_id: str):
 
 @app.post("/api/models/{model_id}/start")
 async def models_start(model_id: str):
+    """Ensures the endpoint/app exists, then always fires a real warm-up
+    request — having an endpoint doesn't mean a GPU is running; both
+    providers only scale up in response to actual traffic. Without the
+    warm-up step this used to return "already running" and do nothing
+    visible at all when the endpoint already existed but was scaled to
+    zero, which looked exactly like the button being broken."""
     models = load_models()
     m = next((x for x in models if x["id"] == model_id), None)
     if not m:
         raise HTTPException(status_code=404, detail="model not found")
     gpu_ids = m.get("gpu_type_ids") or []
     if m["provider"] == "runpod":
-        if (m.get("runpod") or {}).get("endpoint_id"):
-            return {"status": "already running"}
-        m["runpod"] = await runpod_create_model(m["served_name"], m["repo"], m["file"], gpu_ids)
+        if not (m.get("runpod") or {}).get("endpoint_id"):
+            expanded = runpod_gpu_ids_for(gpu_ids[0]) if gpu_ids else gpu_ids
+            m["runpod"] = await runpod_create_model(m["served_name"], m["repo"], m["file"], expanded)
+            save_models(models)
+        asyncio.create_task(_warm_runpod(m["runpod"]["endpoint_id"], m["served_name"]))
     elif m["provider"] == "modal":
-        if (m.get("modal") or {}).get("app_name"):
-            return {"status": "already running"}
-        m["modal"] = await modal_create_model(m["served_name"], m["repo"], m["file"], gpu_ids[0])
-    save_models(models)
-    log.warning("Started model %s", model_id)
-    return m
+        if not (m.get("modal") or {}).get("app_name"):
+            m["modal"] = await modal_create_model(m["served_name"], m["repo"], m["file"], gpu_ids[0])
+            save_models(models)
+        web_url = (m.get("modal") or {}).get("web_url")
+        if web_url:
+            asyncio.create_task(_warm_modal(web_url))
+        else:
+            log.warning("model %s has no web_url on record — can't send a warm-up request", model_id)
+    log.warning("Starting model %s (warm-up request sent)", model_id)
+    return {**m, "note": "warm-up request sent — cold start can take anywhere from ~1 minute to "
+                          "~30 minutes depending on whether the model is already on the shared volume; "
+                          "it'll show up under 'currently spending money' once a worker is actually up"}
 
 
 @app.delete("/api/models/{model_id}")
@@ -674,6 +754,180 @@ async def models_remove(model_id: str):
     save_models(models)
     log.warning("Removed model %s", model_id)
     return {"status": "removed"}
+
+
+def model_connection_info(m: dict) -> dict:
+    """What a client (OpenAI SDK, AnythingLLM, curl) needs to actually talk
+    to this model. Always the SAME base_url for every model on either
+    provider — /v1/chat/completions etc. below dispatch by the request's
+    "model" field to whichever endpoint/app that model actually lives on,
+    so one gateway covers all of them instead of needing a different URL
+    per model."""
+    deployed = bool((m.get("runpod") or {}).get("endpoint_id") or (m.get("modal") or {}).get("web_url"))
+    port = os.environ.get("DASHBOARD_PORT", "8787")
+    return {
+        "base_url": f"http://localhost:{port}/v1",
+        "model": m["served_name"],
+        "api_key": PROXY_API_KEY or None,
+        "ready": deployed,
+        "note": None if deployed else "Start this model first — it has no live endpoint/app to route requests to.",
+    }
+
+
+# --------------------------------------------------------- OpenAI gateway --
+# One base_url for every model this panel knows about: the "model" field
+# in the request picks which Runpod endpoint or Modal app actually serves
+# it. Runpod jobs are translated the same way proxy/main.py does for a
+# single model; Modal models already speak OpenAI wire format natively via
+# src/modal_gateway.py, so those are a straight reverse-proxy.
+
+def check_gateway_auth(authorization: str | None) -> None:
+    if not PROXY_API_KEY:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if authorization[len("Bearer "):] != PROXY_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+
+def find_model_by_served_name(served_name: str) -> dict | None:
+    for m in load_models():
+        if m["served_name"] == served_name:
+            return m
+    return None
+
+
+async def _runpod_job(endpoint_id: str, route: str, body: dict):
+    base = f"https://api.runpod.ai/v2/{endpoint_id}"
+    headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
+    stream = bool(body.get("stream", False))
+    runpod_input = {"input": {"route": route, "payload": body}}
+
+    if stream:
+        async def event_stream():
+            async with httpx.AsyncClient(timeout=None) as client:
+                submit = await client.post(f"{base}/run", json=runpod_input, headers=headers)
+                if submit.status_code >= 400:
+                    log.error("gateway: runpod /run failed %s: %s", submit.status_code, submit.text[:500])
+                    yield f"data: {json.dumps({'error': 'upstream submit failed'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                job_id = submit.json()["id"]
+                while True:
+                    r = await client.get(f"{base}/stream/{job_id}", headers=headers)
+                    if r.status_code >= 400:
+                        log.error("gateway: stream poll failed %s: %s", r.status_code, r.text[:300])
+                        break
+                    data = r.json()
+                    for item in data.get("stream", []):
+                        out = item.get("output")
+                        if out is not None:
+                            yield f"data: {json.dumps(out)}\n\n"
+                    if data.get("status") in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"):
+                        break
+                    await asyncio.sleep(0.15)
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        r = await client.post(f"{base}/runsync", json=runpod_input, headers=headers)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail="upstream error")
+        result = r.json()
+        if result.get("status") != "COMPLETED":
+            job_id = result.get("id")
+            if not job_id:
+                raise HTTPException(status_code=502, detail=f"unexpected upstream status: {result.get('status')}")
+            while True:
+                s = await client.get(f"{base}/status/{job_id}", headers=headers)
+                result = s.json()
+                if result.get("status") in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"):
+                    break
+                await asyncio.sleep(0.5)
+        if result.get("status") != "COMPLETED":
+            raise HTTPException(status_code=504, detail=f"job {result.get('status', 'unknown')}")
+        output = result.get("output")
+        output = (output[-1] if output else {}) if isinstance(output, list) else (output or {})
+        if isinstance(output, dict) and "error" in output:
+            raise HTTPException(status_code=502, detail=output["error"])
+        return JSONResponse(content=output)
+
+
+async def _modal_forward(web_url: str, route: str, body: dict):
+    url = f"{web_url}{route}"
+    headers = {"Content-Type": "application/json"}
+    if PROXY_API_KEY:
+        headers["Authorization"] = f"Bearer {PROXY_API_KEY}"
+    stream = bool(body.get("stream", False))
+
+    if stream:
+        async def event_stream():
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", url, json=body, headers=headers) as resp:
+                    if resp.status_code >= 400:
+                        detail = await resp.aread()
+                        log.error("gateway: modal upstream %s: %s", resp.status_code, detail[:500])
+                        yield f"data: {json.dumps({'error': 'upstream error'})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if line:
+                            yield f"{line}\n\n"
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        r = await client.post(url, json=body, headers=headers)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail="upstream error")
+        return JSONResponse(content=r.json())
+
+
+async def _gateway_dispatch(route: str, body: dict):
+    served_name = body.get("model")
+    if not served_name:
+        raise HTTPException(status_code=400, detail="missing 'model' in request body")
+    m = find_model_by_served_name(served_name)
+    if not m:
+        raise HTTPException(status_code=404, detail=f"no model named {served_name!r} is tracked by this panel")
+    if m["provider"] == "runpod":
+        endpoint_id = (m.get("runpod") or {}).get("endpoint_id")
+        if not endpoint_id:
+            raise HTTPException(status_code=409, detail=f"model {served_name!r} is stopped — Start it first")
+        return await _runpod_job(endpoint_id, route, body)
+    if m["provider"] == "modal":
+        web_url = (m.get("modal") or {}).get("web_url")
+        if not web_url:
+            raise HTTPException(status_code=409, detail=f"model {served_name!r} is stopped — Start it first")
+        return await _modal_forward(web_url, route, body)
+    raise HTTPException(status_code=500, detail=f"unknown provider for model {served_name!r}")
+
+
+@app.get("/v1/models")
+async def gateway_list_models(authorization: str | None = Header(default=None)):
+    check_gateway_auth(authorization)
+    now = int(time.time())
+    data = []
+    for m in load_models():
+        if (m.get("runpod") or {}).get("endpoint_id") or (m.get("modal") or {}).get("web_url"):
+            data.append({"id": m["served_name"], "object": "model", "created": now, "owned_by": m["provider"]})
+    return {"object": "list", "data": data}
+
+
+@app.post("/v1/chat/completions")
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE}/minute")
+async def gateway_chat_completions(request: Request, authorization: str | None = Header(default=None)):
+    check_gateway_auth(authorization)
+    body = await request.json()
+    return await _gateway_dispatch("/v1/chat/completions", body)
+
+
+@app.post("/v1/completions")
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE}/minute")
+async def gateway_completions(request: Request, authorization: str | None = Header(default=None)):
+    check_gateway_auth(authorization)
+    body = await request.json()
+    return await _gateway_dispatch("/v1/completions", body)
 
 
 # ------------------------------------------------------------------- UI --

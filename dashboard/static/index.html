@@ -58,15 +58,28 @@
     background: #0e1420; color: var(--text); font-size: 13px;
   }
   .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+  .model-row-wrap { margin-bottom: 10px; }
   .model-row {
     background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-    padding: 14px 16px; margin-bottom: 10px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 14px 16px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    cursor: pointer;
   }
   .model-row .info { flex: 1; min-width: 180px; }
   .model-row .name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
   .model-row .meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
   .model-row .cost { font-weight: 600; color: #ffd27a; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .model-row .actions { display: flex; gap: 8px; }
+  .conn-panel-slot.hidden { display: none; }
+  .conn-panel {
+    background: #0e1420; border: 1px solid var(--border); border-top: none;
+    border-radius: 0 0 10px 10px; padding: 14px 16px; margin-top: -2px;
+  }
+  .snippet-label { font-size: 11px; color: var(--muted); margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .03em; }
+  .snippet {
+    background: #0b0f14; border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+    font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+    word-break: break-all; margin: 0; color: #c8d4e0;
+  }
   .empty { color: var(--muted); font-size: 13px; padding: 16px 0; text-align: center; }
   .toggle-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin: -2px 0 10px; }
   .gpu-rec { margin-top: 10px; font-size: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); line-height: 1.6; }
@@ -221,10 +234,38 @@ wireAction('modal-teardown', '/api/modal/teardown', 'modal-log', refreshAll,
 // ------------------------------------------------------------- models --
 
 let showAll = false;
+let expandedModels = new Set();
 document.getElementById('show-all-toggle').addEventListener('change', (e) => {
   showAll = e.target.checked;
   refreshModels();
 });
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function connectionPanelHtml(m) {
+  const c = m.connection || {};
+  const apiKey = c.api_key || '(none set — PROXY_API_KEY is empty in .env)';
+  const curl = `curl ${c.base_url}/chat/completions \\\n` +
+    `  -H "Authorization: Bearer ${c.api_key || 'YOUR_PROXY_API_KEY'}" -H "Content-Type: application/json" \\\n` +
+    `  -d '{"model":"${m.served_name}","messages":[{"role":"user","content":"Hello"}]}'`;
+  const py = `from openai import OpenAI\n\n` +
+    `client = OpenAI(api_key="${c.api_key || 'YOUR_PROXY_API_KEY'}", base_url="${c.base_url}")\n` +
+    `r = client.chat.completions.create(model="${m.served_name}", messages=[{"role":"user","content":"Hello"}])\n` +
+    `print(r.choices[0].message.content)`;
+  return `
+    <div class="conn-panel">
+      <div class="row"><span class="k">Base URL</span><span class="v">${c.base_url}</span></div>
+      <div class="row"><span class="k">Model</span><span class="v">${m.served_name}</span></div>
+      <div class="row"><span class="k">API key</span><span class="v">${escapeHtml(apiKey)}</span></div>
+      ${!c.ready ? `<div class="gpu-rec warn" style="margin-top:8px">${c.note}</div>` : ''}
+      <div class="snippet-label">curl</div>
+      <pre class="snippet">${escapeHtml(curl)}</pre>
+      <div class="snippet-label">Python (openai SDK)</div>
+      <pre class="snippet">${escapeHtml(py)}</pre>
+    </div>`;
+}
 
 function modelRowHtml(m) {
   const st = m.status || {};
@@ -233,17 +274,20 @@ function modelRowHtml(m) {
   const stateLabel = spending ? `running — ${fmtMoney2(st.est_cost_per_hr)}/hr` : (st.state || 'stopped');
   const canStart = !spending;
   return `
-    <div class="model-row">
-      <div class="info">
-        <div class="name"><span class="dot ${spending ? 'on' : 'off'}"></span> ${m.served_name}</div>
-        <div class="meta">${m.provider} · ${gpu} · ${m.repo}</div>
+    <div class="model-row-wrap">
+      <div class="model-row" data-toggle="${m.id}">
+        <div class="info">
+          <div class="name"><span class="dot ${spending ? 'on' : 'off'}"></span> ${m.served_name}</div>
+          <div class="meta">${m.provider} · ${gpu} · ${m.repo}</div>
+        </div>
+        <div class="cost">${spending ? fmtMoney2(st.est_cost_per_hr) + '/hr' : stateLabel}</div>
+        <div class="actions">
+          ${canStart ? `<button class="start" data-action="start" data-id="${m.id}">Start</button>` : ''}
+          ${spending ? `<button class="stop" data-action="stop" data-id="${m.id}">Stop</button>` : ''}
+          <button class="stop" data-action="remove" data-id="${m.id}">Remove</button>
+        </div>
       </div>
-      <div class="cost">${spending ? fmtMoney2(st.est_cost_per_hr) + '/hr' : stateLabel}</div>
-      <div class="actions">
-        ${canStart ? `<button class="start" data-action="start" data-id="${m.id}">Start</button>` : ''}
-        ${spending ? `<button class="stop" data-action="stop" data-id="${m.id}">Stop</button>` : ''}
-        <button class="stop" data-action="remove" data-id="${m.id}">Remove</button>
-      </div>
+      <div class="conn-panel-slot ${expandedModels.has(m.id) ? '' : 'hidden'}" data-conn="${m.id}">${connectionPanelHtml(m)}</div>
     </div>`;
 }
 
@@ -272,7 +316,18 @@ async function refreshModels() {
 
 document.getElementById('models-list').addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-action]');
-  if (!btn) return;
+  if (!btn) {
+    const row = e.target.closest('[data-toggle]');
+    if (row) {
+      const id = row.dataset.toggle;
+      const panel = document.querySelector(`[data-conn="${CSS.escape(id)}"]`);
+      if (panel) {
+        const nowHidden = panel.classList.toggle('hidden');
+        if (nowHidden) expandedModels.delete(id); else expandedModels.add(id);
+      }
+    }
+    return;
+  }
   const action = btn.dataset.action;
   const id = btn.dataset.id;
   if (action === 'remove' && !window.confirm(`Remove ${id}? This stops it (if running) and forgets it — ` +
