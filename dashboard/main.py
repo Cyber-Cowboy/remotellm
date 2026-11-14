@@ -96,27 +96,110 @@ def parse_hf_input(raw: str) -> tuple[str, str | None]:
     raise ValueError(f"couldn't parse a Hugging Face repo/file from: {raw!r}")
 
 
-async def find_gguf_file(repo_id: str) -> str:
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(f"https://huggingface.co/api/models/{repo_id}")
+async def list_repo_files(repo_id: str) -> list[dict]:
+    """Uses the tree API (not /api/models/{repo}) specifically because it's
+    the one that includes file sizes — needed for the GPU/VRAM estimate."""
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        r = await client.get(f"https://huggingface.co/api/models/{repo_id}/tree/main")
         if r.status_code == 404:
             raise ValueError(f"repo not found on Hugging Face: {repo_id}")
         r.raise_for_status()
-        siblings = r.json().get("siblings", [])
-    ggufs = [s["rfilename"] for s in siblings if s["rfilename"].lower().endswith(".gguf")]
+        return r.json()
+
+
+async def find_gguf_file(repo_id: str) -> tuple[str, int | None]:
+    files = await list_repo_files(repo_id)
+    ggufs = [f for f in files if f.get("path", "").lower().endswith(".gguf")]
     if len(ggufs) == 1:
-        return ggufs[0]
+        return ggufs[0]["path"], ggufs[0].get("size")
     if not ggufs:
         raise ValueError(f"no .gguf files found in {repo_id} (only GGUF models are supported here)")
     raise ValueError(
         f"{len(ggufs)} .gguf files found in {repo_id} — paste a direct link to the one you want, e.g. "
-        f"https://huggingface.co/{repo_id}/resolve/main/{ggufs[0]}"
+        f"https://huggingface.co/{repo_id}/resolve/main/{ggufs[0]['path']}"
     )
+
+
+async def file_size(repo_id: str, filename: str) -> int | None:
+    try:
+        files = await list_repo_files(repo_id)
+    except ValueError:
+        return None
+    for f in files:
+        if f.get("path") == filename:
+            return f.get("size")
+    return None
 
 
 def derive_served_name(repo_id: str) -> str:
     name = re.sub(r"[^a-z0-9]+", "-", repo_id.split("/")[-1].lower()).strip("-")
     return name or "custom-model"
+
+
+# Rough single-GPU VRAM tiers this deployment could realistically target
+# (gpuCount is hardcoded to 1 in deploy/create_infra.py and modal_app.py —
+# there's no multi-GPU tensor-split support here, so anything bigger than
+# the top tier genuinely doesn't fit today).
+GPU_TIERS = [
+    (16, "~16GB (T4)"),
+    (24, "~24GB (L4 / A10)"),
+    (48, "~48GB (L40S / A40 / RTX 6000 Ada)"),
+    (80, "~80GB (A100-80GB / H100)"),
+    (96, "~96GB (RTX PRO 6000 Blackwell)"),
+    (141, "~141GB (H200)"),
+    (180, "~180GB (B200)"),
+]
+
+# Best-effort VRAM guess for whatever's currently in RUNPOD_GPU_TYPE_IDS /
+# MODAL_GPU_TYPES, just so the recommendation can say "bigger than your
+# current config" instead of showing a number with nothing to compare to.
+_VRAM_HINTS = [
+    ("SXM4-40GB", 40), ("A100-40GB", 40), ("40GB", 40),
+    ("B300", 288), ("B200", 180), ("H200", 141), ("H100 NVL", 94),
+    ("RTX PRO 6000", 96), ("H100", 80), ("A100", 80),
+    ("L40", 48), ("A40", 48), ("RTX A6000", 48), ("RTX 6000", 48),
+    ("L4", 24), ("A10", 24), ("T4", 16),
+]
+
+
+def guess_vram_gb(gpu_name: str) -> int | None:
+    name_u = gpu_name.upper()
+    for key, gb in _VRAM_HINTS:
+        if key.upper() in name_u:
+            return gb
+    return None
+
+
+def current_gpu_ceiling_gb() -> int | None:
+    sizes = [guess_vram_gb(g) for g in RUNPOD_GPU_TYPE_IDS] + \
+            [guess_vram_gb(g) for g in os.environ.get("MODAL_GPU_TYPES", "A100-80GB,H100").split(",")]
+    sizes = [s for s in sizes if s]
+    return max(sizes) if sizes else None
+
+
+def recommend_gpu(size_bytes: int | None) -> dict:
+    if not size_bytes:
+        return {"note": "couldn't determine the file's size from Hugging Face — no GPU estimate available"}
+    file_gb = size_bytes / 1e9
+    # weights + ~15% for KV cache/runtime overhead + a small flat buffer
+    required_gb = file_gb * 1.15 + 2
+    rec = {"file_gb": round(file_gb, 1), "estimated_vram_gb": round(required_gb, 1)}
+    current_ceiling = current_gpu_ceiling_gb()
+    if current_ceiling:
+        rec["current_config_max_gb"] = current_ceiling
+    for cap, label in GPU_TIERS:
+        if required_gb <= cap:
+            rec["recommended_tier"] = label
+            rec["fits_current_config"] = bool(current_ceiling and required_gb <= current_ceiling)
+            return rec
+    rec["recommended_tier"] = None
+    rec["fits_current_config"] = False
+    rec["note"] = (
+        f"needs an estimated ~{required_gb:.0f}GB VRAM — exceeds the largest single GPU this deployment "
+        f"supports (~180GB, B200). It would need multi-GPU tensor-split, which this project doesn't "
+        f"implement yet."
+    )
+    return rec
 
 
 class ModelUpdateRequest(BaseModel):
@@ -138,9 +221,11 @@ async def model_update(req: ModelUpdateRequest):
     try:
         repo_id, filename = parse_hf_input(req.hf_url)
         if filename is None:
-            filename = await find_gguf_file(repo_id)
+            filename, size_bytes = await find_gguf_file(repo_id)
         elif not filename.lower().endswith(".gguf"):
             raise ValueError(f"only .gguf files are supported by llama-server here, got: {filename!r}")
+        else:
+            size_bytes = await file_size(repo_id, filename)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -152,6 +237,9 @@ async def model_update(req: ModelUpdateRequest):
                 status_code=400,
                 detail=f"file not found on Hugging Face ({r.status_code}): {resolve_url}",
             )
+        if size_bytes is None:
+            cl = r.headers.get("content-length")
+            size_bytes = int(cl) if cl else None
 
     served_name = req.served_name.strip() if req.served_name and req.served_name.strip() else derive_served_name(repo_id)
 
@@ -161,8 +249,11 @@ async def model_update(req: ModelUpdateRequest):
     update_env_file({"MODEL_REPO": repo_id, "MODEL_FILE": filename, "SERVED_MODEL_NAME": served_name})
 
     result = {"repo": repo_id, "file": filename, "served_name": served_name,
+              "gpu_recommendation": recommend_gpu(size_bytes),
               "note": "Existing warm workers won't pick this up until their next cold start "
-                      "(Stop then Start to force it immediately)."}
+                      "(Stop then Start to force it immediately). GPU type/count in .env are NOT "
+                      "changed automatically — see gpu_recommendation and update "
+                      "RUNPOD_GPU_TYPE_IDS/MODAL_GPU_TYPES yourself if needed."}
 
     state = load_state()
     template_id = state.get("template_id")

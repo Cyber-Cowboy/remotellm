@@ -56,6 +56,13 @@
   .log.show { display: block; }
   .updated { color: var(--muted); font-size: 11px; margin-top: 18px; text-align: center; }
   .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .gpu-rec {
+    margin-top: 10px; font-size: 12px; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--border); display: none; line-height: 1.5;
+  }
+  .gpu-rec.show { display: block; }
+  .gpu-rec.ok { border-color: #1f4f2b; background: #0f1a12; color: #9fe6ad; }
+  .gpu-rec.warn { border-color: #5c2328; background: #1a1012; color: #ffb4ac; }
   .model-card { margin-top: 16px; }
   .field { margin-bottom: 10px; }
   .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
@@ -121,9 +128,12 @@
       <input type="text" id="model-name" placeholder="my-model">
     </div>
     <button class="primary" id="model-update">Update model</button>
+    <div class="gpu-rec" id="model-gpu-rec"></div>
     <div class="log" id="model-log"></div>
     <div class="note">Updates the Runpod template's env (if an endpoint exists) and the Modal secret (if
-      configured) and .env. Existing warm workers need Stop → Start to actually pick up the new model.</div>
+      configured) and .env. Existing warm workers need Stop → Start to actually pick up the new model.
+      GPU type/count are <b>not</b> changed automatically — only a rough VRAM recommendation is shown;
+      update RUNPOD_GPU_TYPE_IDS / MODAL_GPU_TYPES in .env yourself if it doesn't fit.</div>
   </div>
 
   <div class="updated" id="updated">—</div>
@@ -237,6 +247,27 @@ async function refreshModel() {
   }
 }
 
+function renderGpuRec(rec) {
+  const box = document.getElementById('model-gpu-rec');
+  if (!rec) { box.className = 'gpu-rec'; return; }
+  if (rec.note && !rec.recommended_tier && rec.estimated_vram_gb === undefined) {
+    box.className = 'gpu-rec show warn';
+    box.textContent = rec.note;
+    return;
+  }
+  const lines = [`File: ~${rec.file_gb}GB → estimated VRAM need: ~${rec.estimated_vram_gb}GB`];
+  if (rec.current_config_max_gb) {
+    lines.push(`Current GPU config ceiling: ~${rec.current_config_max_gb}GB — ` +
+      (rec.fits_current_config ? 'fits ✓' : 'does NOT fit, update RUNPOD_GPU_TYPE_IDS/MODAL_GPU_TYPES ✗'));
+  }
+  if (rec.recommended_tier) {
+    lines.push(`Recommended tier: ${rec.recommended_tier}`);
+  }
+  if (rec.note) lines.push(rec.note);
+  box.className = 'gpu-rec show ' + (rec.fits_current_config === false || rec.recommended_tier === null ? 'warn' : 'ok');
+  box.textContent = lines.join('\n');
+}
+
 document.getElementById('model-update').addEventListener('click', async () => {
   const url = document.getElementById('model-url').value.trim();
   const servedName = document.getElementById('model-name').value.trim();
@@ -255,6 +286,7 @@ document.getElementById('model-update').addEventListener('click', async () => {
       body: JSON.stringify({ hf_url: url, served_name: servedName || null }),
     });
     log.textContent = JSON.stringify(res, null, 2);
+    renderGpuRec(res.gpu_recommendation);
     await refreshModel();
   } catch (e) {
     log.textContent = 'Error: ' + e.message;
