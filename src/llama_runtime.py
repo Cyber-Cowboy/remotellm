@@ -1,12 +1,8 @@
 """
 Shared cold-start logic for the llama.cpp (CUDA) backed OpenAI-compatible
 worker: download the GGUF once into persistent storage, then launch
-llama-server and block until it reports healthy.
-
-Used by both src/handler.py (Runpod Serverless) and modal_app.py (Modal),
-which differ only in how they're invoked and how the container's HTTP
-traffic reaches this process — the model-loading and server-launch steps
-are identical either way.
+llama-server and block until it reports healthy. Used by src/handler.py
+(Runpod Serverless).
 """
 import logging
 import os

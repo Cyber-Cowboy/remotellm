@@ -15,12 +15,10 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     padding: 24px 16px;
   }
-  .wrap { max-width: 960px; margin: 0 auto; }
+  .wrap { max-width: 720px; margin: 0 auto; }
   h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
   h2 { font-size: 14px; font-weight: 600; margin: 28px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
   .sub { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
-  .grid2 { display: grid; grid-template-columns: 1fr; gap: 16px; }
-  @media (min-width: 720px) { .grid2 { grid-template-columns: 1fr 1fr; } }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
   .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
   .card-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
@@ -85,9 +83,10 @@
   .gpu-rec { margin-top: 10px; font-size: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); line-height: 1.6; }
   .gpu-rec.ok { border-color: #1f4f2b; background: #0f1a12; color: #9fe6ad; }
   .gpu-rec.warn { border-color: #5c2328; background: #1a1012; color: #ffb4ac; }
-  .gpu-option { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
-  .gpu-option:last-child { border-bottom: none; }
-  .gpu-option .price { font-variant-numeric: tabular-nums; }
+  .start-box {
+    border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px;
+    background: #0f1a12;
+  }
   .hidden { display: none; }
 </style>
 </head>
@@ -96,21 +95,12 @@
   <h1>GPT-OSS control panel</h1>
   <div class="sub">Local only — holds API keys server-side. See .env for credentials.</div>
 
-  <h2>Provider accounts</h2>
-  <div class="grid2">
-    <div class="card">
-      <div class="card-head"><div class="card-title"><span class="dot" id="runpod-dot"></span> Runpod</div></div>
-      <div class="rows" id="runpod-rows"><div class="row"><span class="k">Loading…</span></div></div>
-      <button class="danger" id="runpod-teardown">Delete everything (all Runpod models + shared volume)</button>
-      <div class="log" id="runpod-log"></div>
-    </div>
-    <div class="card">
-      <div class="card-head"><div class="card-title"><span class="dot" id="modal-dot"></span> Modal</div></div>
-      <div class="rows" id="modal-rows"><div class="row"><span class="k">Loading…</span></div></div>
-      <button class="danger" id="modal-teardown">Delete everything (all Modal models + shared volume/secret)</button>
-      <div class="log" id="modal-log"></div>
-      <div class="note">Modal doesn't expose balance via a simple API — check modal.com/settings/billing.</div>
-    </div>
+  <h2>Runpod account</h2>
+  <div class="card">
+    <div class="card-head"><div class="card-title"><span class="dot" id="runpod-dot"></span> Runpod</div></div>
+    <div class="rows" id="runpod-rows"><div class="row"><span class="k">Loading…</span></div></div>
+    <button class="danger" id="runpod-teardown">Delete everything (all models + shared volume)</button>
+    <div class="log" id="runpod-log"></div>
   </div>
 
   <h2>Models currently spending money</h2>
@@ -126,13 +116,6 @@
       <label for="add-url">Hugging Face link (a direct .gguf file link, or just an org/repo)</label>
       <input type="text" id="add-url" placeholder="https://huggingface.co/org/repo/resolve/main/model-Q4_K_M.gguf">
     </div>
-    <div class="field">
-      <label for="add-provider">Provider</label>
-      <select id="add-provider">
-        <option value="runpod">Runpod</option>
-        <option value="modal">Modal</option>
-      </select>
-    </div>
     <button class="primary" id="add-resolve">Check model &amp; recommend hardware</button>
     <div id="add-resolved" class="hidden">
       <div class="gpu-rec" id="add-gpu-rec" style="margin-top:14px"></div>
@@ -141,15 +124,19 @@
         <select id="add-gpu"></select>
       </div>
       <div class="field">
+        <label for="add-ctx">Context window</label>
+        <input type="number" id="add-ctx" placeholder="8192">
+      </div>
+      <div class="field">
         <label for="add-name">Display name (optional — auto-derived from the repo if left blank)</label>
         <input type="text" id="add-name" placeholder="my-model">
       </div>
       <button class="start" style="width:100%" id="add-deploy">Deploy this model</button>
     </div>
     <div class="log" id="add-log"></div>
-    <div class="note">Each model gets its own Runpod endpoint+template or Modal app — they run side by side.
-      Model files share one volume per provider (one subfolder each), so nothing is re-downloaded for models
-      you already deployed before.</div>
+    <div class="note">Each model gets its own Runpod endpoint+template and runs independently. Every model
+      shares one network volume (one subfolder each), so nothing is re-downloaded for models you already
+      deployed before.</div>
   </div>
 
   <div class="updated" id="updated">—</div>
@@ -158,6 +145,7 @@
 <script>
 const fmtMoney = (n) => (n === null || n === undefined || Number.isNaN(n)) ? '—' : '$' + Number(n).toFixed(4);
 const fmtMoney2 = (n) => (n === null || n === undefined || Number.isNaN(n)) ? '—' : '$' + Number(n).toFixed(2);
+const fmtNum = (n) => (n === null || n === undefined) ? '—' : Number(n).toLocaleString();
 
 function row(k, v) {
   return `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
@@ -191,19 +179,6 @@ async function refreshRunpod() {
   }
 }
 
-async function refreshModal() {
-  const dot = document.getElementById('modal-dot');
-  const rows = document.getElementById('modal-rows');
-  try {
-    const s = await fetchJSON('/api/modal/status');
-    dot.className = 'dot ' + (s.configured ? 'on' : 'off');
-    rows.innerHTML = row('Status', s.configured ? 'token configured' : 'not configured (no MODAL_TOKEN_ID)');
-  } catch (e) {
-    rows.innerHTML = row('Error', e.message);
-    dot.className = 'dot err';
-  }
-}
-
 function wireAction(btnId, url, logId, onDone, confirmMsg) {
   document.getElementById(btnId).addEventListener('click', async () => {
     if (confirmMsg && !window.confirm(confirmMsg)) return;
@@ -225,16 +200,14 @@ function wireAction(btnId, url, logId, onDone, confirmMsg) {
 }
 
 wireAction('runpod-teardown', '/api/runpod/teardown', 'runpod-log', refreshAll,
-  'Delete EVERY Runpod model (endpoint+template) AND the shared network volume?\n\n' +
-  'This removes every downloaded model — re-deploying any of them re-downloads from scratch. Cannot be undone.');
-wireAction('modal-teardown', '/api/modal/teardown', 'modal-log', refreshAll,
-  'Delete EVERY Modal model (app+secret) AND the shared volume/registry secret?\n\n' +
+  'Delete EVERY model (endpoint+template) AND the shared network volume?\n\n' +
   'This removes every downloaded model — re-deploying any of them re-downloads from scratch. Cannot be undone.');
 
 // ------------------------------------------------------------- models --
 
 let showAll = false;
 let expandedModels = new Set();
+let gpuOptionsCache = {};  // model id -> gpu-options response
 document.getElementById('show-all-toggle').addEventListener('change', (e) => {
   showAll = e.target.checked;
   refreshModels();
@@ -244,26 +217,52 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+function gpuSelectHtml(idPrefix, modelId, data) {
+  if (!data) return `<div class="note">Loading GPU options…</div>`;
+  const opts = data.options.map(o =>
+    `<option value="${o.id}" ${o.id === data.recommended_id ? 'selected' : ''}>` +
+    `${o.id} — ${o.vram_gb}GB — ${fmtMoney2(o.price_hr)}/hr${o.fits ? '' : ' (too small)'}</option>`
+  ).join('');
+  return `
+    <div class="field">
+      <label for="${idPrefix}-gpu-${modelId}">GPU (price shown per hour while running)</label>
+      <select id="${idPrefix}-gpu-${modelId}">${opts}</select>
+    </div>
+    ${!data.fits_any ? `<div class="note">Doesn't fit any single GPU — would need multi-GPU tensor-split (not implemented).</div>` : ''}`;
+}
+
 function connectionPanelHtml(m) {
   const c = m.connection || {};
   const apiKey = c.api_key || '(none set — PROXY_API_KEY is empty in .env)';
   const curl = `curl ${c.base_url}/chat/completions \\\n` +
     `  -H "Authorization: Bearer ${c.api_key || 'YOUR_PROXY_API_KEY'}" -H "Content-Type: application/json" \\\n` +
-    `  -d '{"model":"${m.served_name}","messages":[{"role":"user","content":"Hello"}]}'`;
+    `  -d '{"model":"${m.served_name}","messages":[{"role":"user","content":"Hello"}],"max_tokens":${c.max_tokens || 512}}'`;
   const py = `from openai import OpenAI\n\n` +
     `client = OpenAI(api_key="${c.api_key || 'YOUR_PROXY_API_KEY'}", base_url="${c.base_url}")\n` +
-    `r = client.chat.completions.create(model="${m.served_name}", messages=[{"role":"user","content":"Hello"}])\n` +
+    `r = client.chat.completions.create(model="${m.served_name}", messages=[{"role":"user","content":"Hello"}], max_tokens=${c.max_tokens || 512})\n` +
     `print(r.choices[0].message.content)`;
+
+  const startSection = !c.ready ? `
+    <div class="start-box" id="start-box-${m.id}">
+      <div class="note" style="margin-top:0">This model has no live endpoint.</div>
+      ${gpuSelectHtml('start', m.id, gpuOptionsCache[m.id])}
+      <button class="start" style="width:100%" data-action="start-with-gpu" data-id="${m.id}">Start</button>
+    </div>` : '';
+
   return `
     <div class="conn-panel">
+      ${startSection}
+      <div class="row"><span class="k">Context window</span><span class="v">${fmtNum(m.recommended_context_window)}</span></div>
+      <div class="row"><span class="k">Max tokens (suggested)</span><span class="v">${fmtNum(m.recommended_max_tokens)}</span></div>
+      ${c.ready ? `
       <div class="row"><span class="k">Base URL</span><span class="v">${c.base_url}</span></div>
       <div class="row"><span class="k">Model</span><span class="v">${m.served_name}</span></div>
       <div class="row"><span class="k">API key</span><span class="v">${escapeHtml(apiKey)}</span></div>
-      ${!c.ready ? `<div class="gpu-rec warn" style="margin-top:8px">${c.note}</div>` : ''}
       <div class="snippet-label">curl</div>
       <pre class="snippet">${escapeHtml(curl)}</pre>
       <div class="snippet-label">Python (openai SDK)</div>
       <pre class="snippet">${escapeHtml(py)}</pre>
+      ` : ''}
     </div>`;
 }
 
@@ -271,18 +270,18 @@ function modelRowHtml(m) {
   const st = m.status || {};
   const gpu = (m.gpu_type_ids || [])[0] || '—';
   const spending = st.spending;
+  const ready = !!(m.connection && m.connection.ready);
   const stateLabel = spending ? `running — ${fmtMoney2(st.est_cost_per_hr)}/hr` : (st.state || 'stopped');
-  const canStart = !spending;
   return `
     <div class="model-row-wrap">
       <div class="model-row" data-toggle="${m.id}">
         <div class="info">
           <div class="name"><span class="dot ${spending ? 'on' : 'off'}"></span> ${m.served_name}</div>
-          <div class="meta">${m.provider} · ${gpu} · ${m.repo}</div>
+          <div class="meta">${gpu} · ${m.repo}</div>
         </div>
         <div class="cost">${spending ? fmtMoney2(st.est_cost_per_hr) + '/hr' : stateLabel}</div>
         <div class="actions">
-          ${canStart ? `<button class="start" data-action="start" data-id="${m.id}">Start</button>` : ''}
+          ${(ready && !spending) ? `<button class="start" data-action="start" data-id="${m.id}">Start</button>` : ''}
           ${spending ? `<button class="stop" data-action="stop" data-id="${m.id}">Stop</button>` : ''}
           <button class="stop" data-action="remove" data-id="${m.id}">Remove</button>
         </div>
@@ -291,6 +290,8 @@ function modelRowHtml(m) {
       <div class="conn-panel-slot ${expandedModels.has(m.id) ? '' : 'hidden'}" data-conn="${m.id}">${connectionPanelHtml(m)}</div>
     </div>`;
 }
+
+let lastModels = [];
 
 async function refreshModels() {
   const list = document.getElementById('models-list');
@@ -304,6 +305,7 @@ async function refreshModels() {
       shown = allRes.models;
       hiddenCount = 0;
     }
+    lastModels = shown;
     document.getElementById('idle-count').textContent = hiddenCount;
     if (!shown.length) {
       list.innerHTML = `<div class="empty">${showAll ? 'No models tracked yet.' : 'No models are currently spending money.'}</div>`;
@@ -315,16 +317,26 @@ async function refreshModels() {
   }
 }
 
+async function expandModel(id) {
+  expandedModels.add(id);
+  const m = lastModels.find(x => x.id === id);
+  if (m && !(m.connection && m.connection.ready) && !gpuOptionsCache[id]) {
+    gpuOptionsCache[id] = await fetchJSON(`/api/models/${encodeURIComponent(id)}/gpu-options`).catch(() => null);
+  }
+  await refreshModels();
+}
+
 document.getElementById('models-list').addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-action]');
   if (!btn) {
-    const row = e.target.closest('[data-toggle]');
-    if (row) {
-      const id = row.dataset.toggle;
-      const panel = document.querySelector(`[data-conn="${CSS.escape(id)}"]`);
-      if (panel) {
-        const nowHidden = panel.classList.toggle('hidden');
-        if (nowHidden) expandedModels.delete(id); else expandedModels.add(id);
+    const toggleRow = e.target.closest('[data-toggle]');
+    if (toggleRow) {
+      const id = toggleRow.dataset.toggle;
+      if (expandedModels.has(id)) {
+        expandedModels.delete(id);
+        await refreshModels();
+      } else {
+        await expandModel(id);
       }
     }
     return;
@@ -336,8 +348,20 @@ document.getElementById('models-list').addEventListener('click', async (e) => {
   btn.disabled = true;
   try {
     if (action === 'start') await fetchJSON(`/api/models/${encodeURIComponent(id)}/start`, { method: 'POST' });
+    if (action === 'start-with-gpu') {
+      const sel = document.getElementById(`start-gpu-${id}`);
+      const gpuId = sel ? sel.value : null;
+      if (!gpuId) { alert('No GPU selected'); btn.disabled = false; return; }
+      await fetchJSON(`/api/models/${encodeURIComponent(id)}/start`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gpu_id: gpuId }),
+      });
+    }
     if (action === 'stop') await fetchJSON(`/api/models/${encodeURIComponent(id)}/stop`, { method: 'POST' });
-    if (action === 'remove') await fetchJSON(`/api/models/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (action === 'remove') {
+      delete gpuOptionsCache[id];
+      await fetchJSON(`/api/models/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    }
   } catch (err) {
     alert('Error: ' + err.message);
   } finally {
@@ -370,7 +394,6 @@ function renderGpuOptions(options, recommendedId) {
 
 document.getElementById('add-resolve').addEventListener('click', async () => {
   const url = document.getElementById('add-url').value.trim();
-  const provider = document.getElementById('add-provider').value;
   if (!url) return;
   const btn = document.getElementById('add-resolve');
   const log = document.getElementById('add-log');
@@ -381,11 +404,14 @@ document.getElementById('add-resolve').addEventListener('click', async () => {
     resolved = await fetchJSON('/api/models/resolve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hf_url: url, provider }),
+      body: JSON.stringify({ hf_url: url }),
     });
     log.className = 'log';
     document.getElementById('add-resolved').classList.remove('hidden');
     document.getElementById('add-name').value = resolved.served_name || '';
+    document.getElementById('add-ctx').value = resolved.recommended_context_window || '';
+    document.getElementById('add-ctx').placeholder = resolved.recommended_context_window ?
+      `recommended: ${resolved.recommended_context_window}` : '8192';
     renderGpuRec(resolved);
     renderGpuOptions(resolved.options, resolved.recommended_id);
   } catch (e) {
@@ -399,23 +425,27 @@ document.getElementById('add-resolve').addEventListener('click', async () => {
 
 document.getElementById('add-deploy').addEventListener('click', async () => {
   if (!resolved) return;
-  const provider = document.getElementById('add-provider').value;
   const gpuId = document.getElementById('add-gpu').value;
   const servedName = document.getElementById('add-name').value.trim();
-  const priceEl = document.getElementById('add-gpu').selectedOptions[0];
-  if (!window.confirm(`Deploy ${resolved.repo}/${resolved.file} on ${provider} (${gpuId})?\n\n` +
+  const ctx = document.getElementById('add-ctx').value.trim();
+  if (!window.confirm(`Deploy ${resolved.repo}/${resolved.file} on ${gpuId}?\n\n` +
       `This starts billing as soon as the first request arrives, and keeps a model-cache volume costing ` +
       `storage even when idle. Continue?`)) return;
   const btn = document.getElementById('add-deploy');
   const log = document.getElementById('add-log');
   btn.disabled = true;
   log.className = 'log show';
-  log.textContent = 'Deploying… (Runpod: a few seconds; Modal: can take a minute to build the image)';
+  log.textContent = 'Deploying…';
   try {
     const res = await fetchJSON('/api/models', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hf_url: document.getElementById('add-url').value.trim(), provider, gpu_id: gpuId, served_name: servedName || null }),
+      body: JSON.stringify({
+        hf_url: document.getElementById('add-url').value.trim(),
+        gpu_id: gpuId,
+        served_name: servedName || null,
+        context_window: ctx ? parseInt(ctx, 10) : null,
+      }),
     });
     log.textContent = JSON.stringify(res, null, 2);
     document.getElementById('add-resolved').classList.add('hidden');
@@ -432,7 +462,7 @@ document.getElementById('add-deploy').addEventListener('click', async () => {
 // --------------------------------------------------------------- tick --
 
 async function refreshAll() {
-  await Promise.all([refreshRunpod(), refreshModal(), refreshModels()]);
+  await Promise.all([refreshRunpod(), refreshModels()]);
   document.getElementById('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
 }
 

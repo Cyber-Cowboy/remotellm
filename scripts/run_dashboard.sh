@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Local control panel: balance/spend + Start/Stop for both providers.
-# Binds to 127.0.0.1 only — it holds RUNPOD_API_KEY/MODAL_TOKEN_* server-side.
+# Local control panel: balance/spend + Start/Stop, run several models
+# side by side, and a unified OpenAI-compatible gateway at :8787/v1.
+# Binds to 127.0.0.1 only — it holds RUNPOD_API_KEY server-side.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

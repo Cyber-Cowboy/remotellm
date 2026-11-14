@@ -1,12 +1,6 @@
 """
 Runpod Serverless handler for a GGUF (llama.cpp) backed OpenAI-compatible model.
 
-NOTE: the active deployment path for this project is Modal (see modal_app.py
-at the repo root) — Runpod Serverless required a prepaid account balance the
-user couldn't provide, so this file is kept as a documented alternative /
-fallback path rather than deleted. It still works as-is if you have a
-funded Runpod account; see README.md.
-
 Lifecycle per container (worker):
   1. Module import  -> ensure_model_downloaded()  -> ensure_llama_server_running()
      This happens ONCE per cold start. The model is loaded into VRAM here, not

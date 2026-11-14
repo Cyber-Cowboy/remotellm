@@ -1,6 +1,5 @@
 .env
 deploy/infra_state.json
-deploy/modal_state.json
 dashboard/models.json
 *.gguf
 *.log
