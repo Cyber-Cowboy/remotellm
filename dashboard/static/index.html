@@ -287,6 +287,7 @@ function modelRowHtml(m) {
           <button class="stop" data-action="remove" data-id="${m.id}">Remove</button>
         </div>
       </div>
+      ${st.warning ? `<div class="gpu-rec warn" style="border-radius:0;border-top:none">⚠ ${escapeHtml(st.warning)}</div>` : ''}
       <div class="conn-panel-slot ${expandedModels.has(m.id) ? '' : 'hidden'}" data-conn="${m.id}">${connectionPanelHtml(m)}</div>
     </div>`;
 }

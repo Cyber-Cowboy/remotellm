@@ -272,14 +272,39 @@ def gpu_price(provider: str, gpu_id: str) -> float | None:
 # 80GB PCIe alone, once). Passing every same-tier id as a fallback list
 # costs nothing (Runpod bills whichever one it actually schedules) and
 # makes that failure mode much less likely.
-_RUNPOD_TIER_GROUPS = [
-    ["NVIDIA A100 80GB PCIe", "NVIDIA A100-SXM4-80GB"],
-    ["NVIDIA H100 PCIe", "NVIDIA H100 80GB HBM3"],
-]
+# A few more real Runpod enum values at the same VRAM tier *and* price as
+# something in RUNPOD_GPU_CATALOG, not listed there separately, but worth
+# trying as fallbacks too — same reasoning as the catalog-derived groups
+# below. Keyed the same way: (vram_gb, price_hr).
+_RUNPOD_EXTRA_TIER_SKUS = {
+    (48, 1.22): ["NVIDIA RTX 6000 Ada Generation", "NVIDIA L40"],
+}
+
+
+def _runpod_tier_groups() -> list[list[str]]:
+    # Grouped by (vram_gb, price_hr), not just vram_gb — A100 and H100 are
+    # both "80GB" but very different prices, and silently falling back
+    # from one to the other would mean paying ~2x what the cost estimate
+    # shown before deploying said, without the user ever agreeing to it.
+    by_tier: dict[tuple[int, float], list[str]] = {}
+    for g in RUNPOD_GPU_CATALOG:
+        by_tier.setdefault((g["vram_gb"], g["price_hr"]), []).append(g["id"])
+    for tier, extra in _RUNPOD_EXTRA_TIER_SKUS.items():
+        by_tier.setdefault(tier, []).extend(extra)
+    return list(by_tier.values())
 
 
 def runpod_gpu_ids_for(gpu_id: str) -> list[str]:
-    for group in _RUNPOD_TIER_GROUPS:
+    """Every same-VRAM-tier SKU as a fallback list, not just the one the
+    user picked. Found by hand, twice, on two different tiers (RTX A4000,
+    then RTX A6000): Runpod's own capacity varies by exact SKU within a
+    data center, and a deploy with only one GPU id can sit at zero
+    workers forever — IN_QUEUE, no initializing/running/throttled, nothing
+    — if that SKU has none available right now. The API accepts the
+    request either way, so this looks identical to the Start button being
+    broken. Passing every same-tier id costs nothing extra (billed at
+    whichever one actually gets scheduled) and makes it much less likely."""
+    for group in _runpod_tier_groups():
         if gpu_id in group:
             return group
     return [gpu_id]
@@ -409,31 +434,48 @@ async def runpod_create_model(served_name: str, repo: str, filename: str, gpu_id
     return {"template_id": template_id, "endpoint_id": endpoint_id}
 
 
-async def _warm_runpod(endpoint_id: str, served_name: str) -> None:
+async def _warm_runpod(endpoint_id: str, served_name: str) -> dict:
     """Runpod only spins up a worker in response to an actual job — an
     endpoint existing isn't enough. Fire a trivial job so Start actually
     starts something, instead of silently doing nothing when the endpoint
-    was already there but idle/scaled-to-zero."""
+    was already there but idle/scaled-to-zero. Submission errors (bad
+    endpoint, auth failure, Runpod rejecting the job) are returned, not
+    just logged — a Start that silently fails is indistinguishable from a
+    broken button."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
+            r = await client.post(
                 f"https://api.runpod.ai/v2/{endpoint_id}/run",
                 headers={"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"},
                 json={"input": {"route": "/v1/chat/completions",
                                 "payload": {"model": served_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}}},
             )
-    except Exception as e:  # noqa: BLE001 — best-effort warm-up, never fail the request over it
+            if r.status_code >= 400:
+                return {"submitted": False, "error": f"Runpod rejected the warm-up job ({r.status_code}): {r.text[:300]}"}
+            return {"submitted": True, "job_id": r.json().get("id"), "error": None}
+    except Exception as e:  # noqa: BLE001
         log.warning("warm-up request to Runpod endpoint %s failed: %s", endpoint_id, e)
+        return {"submitted": False, "error": f"couldn't reach Runpod to submit the warm-up job: {e}"}
 
 
-async def _warm_modal(web_url: str) -> None:
+async def _warm_modal(web_url: str) -> dict:
     """Same idea for Modal: an app being deployed doesn't mean a container
     is running — only real traffic to its URL triggers a cold start."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.get(f"{web_url}/health")
+            r = await client.get(f"{web_url}/health")
+            if r.status_code >= 400:
+                return {"submitted": False, "error": f"Modal app returned {r.status_code} to the warm-up request: {r.text[:300]}"}
+            return {"submitted": True, "error": None}
+    except httpx.TimeoutException:
+        # Expected on a real cold start — /health won't answer until the
+        # container finishes booting, which can take minutes. The request
+        # DID reach Modal and start a container; only a connection-level
+        # failure below is a genuine submission error.
+        return {"submitted": True, "error": None, "note": "still booting (timed out waiting for /health, as expected on a cold start)"}
     except Exception as e:  # noqa: BLE001
         log.warning("warm-up request to Modal app %s failed: %s", web_url, e)
+        return {"submitted": False, "error": f"couldn't reach Modal app to warm it up: {e}"}
 
 
 async def runpod_delete_model(m: dict) -> None:
@@ -609,6 +651,27 @@ class AddModelRequest(BaseModel):
     served_name: str | None = None
 
 
+STUCK_WARNING_AFTER_SECONDS = 180  # how long "0 workers since Start" is normal cold-start wait vs. likely stuck
+
+
+def _stuck_warning(m: dict, active_count: int) -> str | None:
+    """A GPU tier with no capacity in the data center accepts the job
+    (Runpod) or the request (Modal) and then just... never schedules
+    anything — no error, no running/initializing worker, forever. Found
+    by hand twice (RTX A4000, then RTX A6000). There's no way to
+    distinguish that from "still queued, give it a minute" from a single
+    status check, so this only warns once Start has had a few minutes to
+    work and nothing shows up at all."""
+    if active_count > 0:
+        return None
+    last_attempt = m.get("last_start_attempt")
+    if not last_attempt or time.time() - last_attempt < STUCK_WARNING_AFTER_SECONDS:
+        return None
+    return (f"Still 0 workers {int(time.time() - last_attempt)}s after Start — the chosen GPU tier "
+            f"({', '.join(m.get('gpu_type_ids') or ['?'])}) may have no capacity in this data center "
+            f"right now. Try removing and re-adding this model with a different GPU.")
+
+
 async def model_live_status(m: dict) -> dict:
     if m["provider"] == "runpod":
         endpoint_id = (m.get("runpod") or {}).get("endpoint_id")
@@ -625,6 +688,7 @@ async def model_live_status(m: dict) -> dict:
             "state": "running" if active > 0 else "idle",
             "workers": summary,
             "est_cost_per_hr": round(price * active, 2) if price else 0,
+            "warning": _stuck_warning(m, active),
         }
     if m["provider"] == "modal":
         app_name = (m.get("modal") or {}).get("app_name")
@@ -635,6 +699,7 @@ async def model_live_status(m: dict) -> dict:
         return {
             "spending": n > 0,
             "state": "running" if n > 0 else "stopped",
+            "warning": _stuck_warning(m, n),
             "containers": n,
             "est_cost_per_hr": round(price * n, 2) if price else 0,
         }
@@ -719,25 +784,38 @@ async def models_start(model_id: str):
     if not m:
         raise HTTPException(status_code=404, detail="model not found")
     gpu_ids = m.get("gpu_type_ids") or []
-    if m["provider"] == "runpod":
-        if not (m.get("runpod") or {}).get("endpoint_id"):
-            expanded = runpod_gpu_ids_for(gpu_ids[0]) if gpu_ids else gpu_ids
-            m["runpod"] = await runpod_create_model(m["served_name"], m["repo"], m["file"], expanded)
-            save_models(models)
-        asyncio.create_task(_warm_runpod(m["runpod"]["endpoint_id"], m["served_name"]))
-    elif m["provider"] == "modal":
-        if not (m.get("modal") or {}).get("app_name"):
-            m["modal"] = await modal_create_model(m["served_name"], m["repo"], m["file"], gpu_ids[0])
-            save_models(models)
-        web_url = (m.get("modal") or {}).get("web_url")
-        if web_url:
-            asyncio.create_task(_warm_modal(web_url))
-        else:
-            log.warning("model %s has no web_url on record — can't send a warm-up request", model_id)
-    log.warning("Starting model %s (warm-up request sent)", model_id)
-    return {**m, "note": "warm-up request sent — cold start can take anywhere from ~1 minute to "
-                          "~30 minutes depending on whether the model is already on the shared volume; "
-                          "it'll show up under 'currently spending money' once a worker is actually up"}
+    warmup: dict = {"submitted": False, "error": "no provider-specific warm-up ran"}
+    try:
+        if m["provider"] == "runpod":
+            if not (m.get("runpod") or {}).get("endpoint_id"):
+                expanded = runpod_gpu_ids_for(gpu_ids[0]) if gpu_ids else gpu_ids
+                m["runpod"] = await runpod_create_model(m["served_name"], m["repo"], m["file"], expanded)
+                save_models(models)
+            warmup = await _warm_runpod(m["runpod"]["endpoint_id"], m["served_name"])
+        elif m["provider"] == "modal":
+            if not (m.get("modal") or {}).get("app_name"):
+                m["modal"] = await modal_create_model(m["served_name"], m["repo"], m["file"], gpu_ids[0])
+                save_models(models)
+            web_url = (m.get("modal") or {}).get("web_url")
+            if web_url:
+                warmup = await _warm_modal(web_url)
+            else:
+                warmup = {"submitted": False, "error": "model has no web_url on record — can't warm it up"}
+    except HTTPException:
+        raise  # from runpod_create_model/modal_create_model — already a clear error, let it surface as-is
+    m["last_start_attempt"] = time.time()
+    save_models(models)
+    log.warning("Starting model %s: warmup=%s", model_id, warmup)
+    if not warmup["submitted"]:
+        # Surface this as a real error, not a 200 with a buried detail —
+        # a Start that silently fails looks exactly like a broken button.
+        raise HTTPException(status_code=502, detail=f"warm-up request failed: {warmup['error']}")
+    return {**m, "warmup": warmup,
+            "note": "warm-up request sent — cold start can take anywhere from ~1 minute to "
+                    "~30 minutes depending on whether the model is already on the shared volume; "
+                    "it'll show up under 'currently spending money' once a worker is actually up. "
+                    "If it's still showing 0 workers after several minutes, the chosen GPU tier may "
+                    "have no capacity right now — try removing and re-adding with a different one."}
 
 
 @app.delete("/api/models/{model_id}")
