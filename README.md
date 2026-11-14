@@ -401,10 +401,34 @@ privacy implications of doing so.
   against the live API (several 400/500 responses that listed the valid
   enum/path), not solely from docs, which were stale or ambiguous on these
   specific points at the time this was built.
-- **Current status:** the worker image is built and pushed. The Runpod
-  network volume, template, and endpoint were created and the first
-  real request was sent — see the chat for the live cold-start timing once
-  it completes. The gateway (`proxy/`) has been verified end-to-end against
-  local mocks (translation, SSE streaming, auth, non-stream path) but not
-  yet deployed publicly — deploy it per §7.1 before exposing this to real
-  clients.
+- **The Dockerfile had a real packaging bug, only catchable on a GPU host:**
+  the CI build/push succeeding never meant the image actually *ran* —
+  `llama-server` crash-looped on every real worker with "cannot open shared
+  object file" because only the executable was copied out of the builder
+  stage, not its sibling `.so` libraries, and even after fixing that,
+  `/usr/local/bin` isn't on the dynamic linker's default search path and
+  `libgomp1` wasn't installed. Both are fixed now (see git history), found
+  by pulling the published image locally and running `ldd`/the real
+  entrypoint directly — the CI build log alone couldn't have caught this.
+- **Current status — verified end-to-end against the real, funded Runpod
+  endpoint:**
+  - First-ever cold start (download 61GB GGUF + load into VRAM): **~27
+    minutes** (one-time only; the model persists on the network volume).
+  - Later cold start (worker restart, model already on the volume): **~98s**.
+  - Warm request latency: **~0.5–5s** depending on prompt/response size;
+    raw generation throughput **~175–195 tokens/sec** on H100 (llama-server's
+    own `predicted_per_second`).
+  - Scale-to-zero confirmed: GPU billing drops to **$0.01/hr (network-volume
+    storage only, not GPU compute)** within the configured `idleTimeout`
+    after the last request; Runpod keeps one flashboot-cached "standby"
+    worker visible as `idle` (not `running`) at all times by design — this
+    is not literally zero *workers* in the API's own count, but it is zero
+    GPU *cost*.
+  - Tested through the full real chain with the actual `openai` Python SDK
+    (both streaming and non-streaming) against the local gateway
+    (`scripts/run_proxy_local.sh`) in front of the real endpoint — see
+    `scripts/benchmark.py`'s output in the session for exact numbers.
+  - The Modal path's code is complete and was verified as far as the Docker
+    image build/push and secret creation; the actual GPU deploy step is
+    blocked on Modal's payment-method requirement (§8) and hasn't been
+    exercised against a real Modal container yet.
