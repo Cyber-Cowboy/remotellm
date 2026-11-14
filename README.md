@@ -391,6 +391,13 @@ models side by side**, each its own Runpod endpoint or Modal app:
   HF, estimates the VRAM it needs, and shows every GPU tier your chosen
   provider offers with its real `$/hr` price — pre-selecting the cheapest
   one that fits. Pick a different tier if you want, then **Deploy**.
+- **Click any model row** to expand its connection info: `base_url`,
+  model name, API key, and a ready-to-paste `curl`/Python snippet. Every
+  model, on either provider, is reachable at the **same** `base_url`
+  (`http://localhost:8787/v1`) — the dashboard itself runs a small
+  OpenAI-compatible gateway that routes each request by its `"model"`
+  field, so you never need a different URL per model. This is what to put
+  into AnythingLLM/any OpenAI-compatible client's "Generic OpenAI" settings.
 
 All models on a provider share one network volume / Modal volume (each
 model gets its own subfolder, named after its "served name"), so adding or
