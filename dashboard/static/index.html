@@ -44,6 +44,10 @@
   button:disabled { opacity: 0.4; cursor: default; }
   button.stop { border-color: #5c2328; color: #ffb4ac; }
   button.start { border-color: #1f4f2b; color: #9fe6ad; }
+  button.danger {
+    width: 100%; margin-top: 10px; background: #2a1212; border-color: #5c2328;
+    color: #ff8a80; font-size: 12px; font-weight: 600;
+  }
   .log {
     margin-top: 12px; font-size: 11px; color: var(--muted); white-space: pre-wrap;
     max-height: 120px; overflow-y: auto; background: #0e1420; border-radius: 6px;
@@ -71,6 +75,7 @@
         <button class="start" id="runpod-start">Start</button>
         <button class="stop" id="runpod-stop">Stop</button>
       </div>
+      <button class="danger" id="runpod-teardown">Delete everything (endpoint + template + volume)</button>
       <div class="log" id="runpod-log"></div>
     </div>
 
@@ -85,6 +90,7 @@
         <button class="start" id="modal-start">Start</button>
         <button class="stop" id="modal-stop">Stop</button>
       </div>
+      <button class="danger" id="modal-teardown">Delete everything (app + volume + secrets)</button>
       <div class="log" id="modal-log"></div>
       <div class="note">Modal doesn't expose balance via a simple API — check modal.com/settings/billing.</div>
     </div>
@@ -160,8 +166,9 @@ async function refreshModal() {
   }
 }
 
-function wireAction(btnId, url, logId, onDone) {
+function wireAction(btnId, url, logId, onDone, confirmMsg) {
   document.getElementById(btnId).addEventListener('click', async () => {
+    if (confirmMsg && !window.confirm(confirmMsg)) return;
     const btn = document.getElementById(btnId);
     const log = document.getElementById(logId);
     btn.disabled = true;
@@ -181,8 +188,14 @@ function wireAction(btnId, url, logId, onDone) {
 
 wireAction('runpod-stop', '/api/runpod/stop', 'runpod-log', refreshRunpod);
 wireAction('runpod-start', '/api/runpod/start', 'runpod-log', refreshRunpod);
+wireAction('runpod-teardown', '/api/runpod/teardown', 'runpod-log', refreshRunpod,
+  'Delete the Runpod endpoint, template, AND network volume?\n\nThis removes the downloaded 61GB model — ' +
+  'the next Start will need to re-download it (~27 min). This cannot be undone.');
 wireAction('modal-stop', '/api/modal/stop', 'modal-log', refreshModal);
 wireAction('modal-start', '/api/modal/start', 'modal-log', refreshModal);
+wireAction('modal-teardown', '/api/modal/teardown', 'modal-log', refreshModal,
+  'Delete the Modal app, its model volume, AND its secrets?\n\nThis removes the downloaded 61GB model — ' +
+  'the next Start will need to re-download it and you will need to re-enter secret values. This cannot be undone.');
 
 async function tick() {
   await Promise.all([refreshRunpod(), refreshModal()]);

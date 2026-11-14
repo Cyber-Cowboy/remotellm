@@ -113,6 +113,35 @@ async def runpod_stop():
     return {"status": "stopped", "endpoint_id": endpoint_id}
 
 
+@app.post("/api/runpod/teardown")
+async def runpod_teardown():
+    """Delete every paid Runpod resource for this deployment: endpoint,
+    template, and the network volume (which holds the 61GB model — the
+    next deploy will have to re-download it). Unlike /stop, this leaves
+    nothing billing at all, not even the volume's storage fee."""
+    state = load_state()
+    deleted = {}
+    async with httpx.AsyncClient(timeout=30) as client:
+        for key, path in (
+            ("endpoint_id", "endpoints"),
+            ("template_id", "templates"),
+            ("network_volume_id", "networkvolumes"),
+        ):
+            resource_id = state.get(key)
+            if not resource_id:
+                continue
+            r = await client.delete(
+                f"https://rest.runpod.io/v1/{path}/{resource_id}",
+                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+            )
+            if r.status_code not in (200, 204, 404):
+                raise HTTPException(status_code=502, detail=f"delete {path}/{resource_id} failed: {r.text}")
+            deleted[key] = resource_id
+    save_state({})  # registry_auth isn't billed; leave teardown of that to re-running deploy.sh if ever needed
+    log.warning("Runpod full teardown: deleted %s", deleted)
+    return {"status": "deleted", "deleted": deleted}
+
+
 @app.post("/api/runpod/start")
 async def runpod_start():
     state = load_state()
@@ -176,6 +205,28 @@ async def modal_stop():
         raise HTTPException(status_code=502, detail=(result.stderr or result.stdout)[-2000:])
     log.info("Modal app %s stopped", MODAL_APP_NAME)
     return {"status": "stopped", "log": result.stdout[-1000:]}
+
+
+@app.post("/api/modal/teardown")
+async def modal_teardown():
+    """Stop the app and delete every paid/stored Modal resource: the model
+    volume (61GB — next deploy re-downloads it) and the two secrets."""
+    steps = [
+        ["python3", "-m", "modal", "app", "stop", MODAL_APP_NAME, "-y"],
+        ["python3", "-m", "modal", "volume", "delete", os.environ.get("MODAL_VOLUME_NAME", "gptoss-120b-model-cache"), "-y"],
+        ["python3", "-m", "modal", "secret", "delete", "gptoss-worker-secrets", "-y"],
+        ["python3", "-m", "modal", "secret", "delete", "dockerhub-registry-secret", "-y"],
+    ]
+    logs = []
+    for cmd in steps:
+        result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=modal_env(), timeout=60)
+        logs.append(f"$ {' '.join(cmd)}\n{result.stdout}{result.stderr}")
+        # Don't hard-fail if a given resource was already gone / never existed.
+    state_file = ROOT / "deploy" / "modal_state.json"
+    if state_file.exists():
+        state_file.unlink()
+    log.warning("Modal full teardown complete")
+    return {"status": "deleted", "log": "\n---\n".join(logs)[-4000:]}
 
 
 @app.post("/api/modal/start")
