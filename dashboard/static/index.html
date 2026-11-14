@@ -26,6 +26,8 @@
   .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
   .dot.off { background: var(--muted); }
   .dot.err { background: var(--red); }
+  .dot.starting { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; box-shadow: 0 0 6px var(--accent); } 50% { opacity: 0.35; box-shadow: none; } }
   .rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
   .row { display: flex; justify-content: space-between; font-size: 13px; gap: 12px; }
   .row .k { color: var(--muted); }
@@ -103,7 +105,7 @@
     <div class="log" id="runpod-log"></div>
   </div>
 
-  <h2>Models currently spending money</h2>
+  <h2>Active models (spending, starting, or needing attention)</h2>
   <div class="toggle-row">
     <input type="checkbox" id="show-all-toggle">
     <label for="show-all-toggle">Show stopped/idle models too (<span id="idle-count">0</span> hidden)</label>
@@ -277,22 +279,37 @@ function connectionPanelHtml(m) {
     </div>`;
 }
 
+function fmtElapsed(sec) {
+  if (sec === null || sec === undefined) return '';
+  if (sec < 60) return `${sec}s`;
+  return `${Math.floor(sec / 60)}m${sec % 60}s`;
+}
+
+function startingLabel(st) {
+  const w = st.workers || {};
+  const busy = ['initializing', 'throttled', 'idle', 'unhealthy']
+    .filter(k => w[k] > 0).map(k => `${w[k]} ${k}`).join(', ');
+  return `starting… ${fmtElapsed(st.seconds_since_start)}${busy ? ' (' + busy + ')' : ' (0 workers yet)'}`;
+}
+
 function modelRowHtml(m) {
   const st = m.status || {};
   const gpu = (m.gpu_type_ids || [])[0] || '—';
   const spending = st.spending;
+  const starting = st.state === 'starting';
   const ready = !!(m.connection && m.connection.ready);
-  const stateLabel = spending ? `running — ${fmtMoney2(st.est_cost_per_hr)}/hr` : (st.state || 'stopped');
+  const stateLabel = spending ? `running — ${fmtMoney2(st.est_cost_per_hr)}/hr` :
+    starting ? startingLabel(st) : (st.state || 'stopped');
   return `
     <div class="model-row-wrap">
       <div class="model-row" data-toggle="${m.id}">
         <div class="info">
-          <div class="name"><span class="dot ${spending ? 'on' : 'off'}"></span> ${m.served_name}</div>
+          <div class="name"><span class="dot ${spending ? 'on' : (starting ? 'starting' : 'off')}"></span> ${m.served_name}</div>
           <div class="meta">${gpu} · ${m.repo}</div>
         </div>
-        <div class="cost">${spending ? fmtMoney2(st.est_cost_per_hr) + '/hr' : stateLabel}</div>
+        <div class="cost" style="${starting ? 'color:#8ec3ff' : ''}">${spending ? fmtMoney2(st.est_cost_per_hr) + '/hr' : stateLabel}</div>
         <div class="actions">
-          ${(ready && !spending) ? `<button class="start" data-action="start" data-id="${m.id}">Start</button>` : ''}
+          ${(ready && !spending && !starting) ? `<button class="start" data-action="start" data-id="${m.id}">Start</button>` : ''}
           ${spending ? `<button class="stop" data-action="stop" data-id="${m.id}">Stop</button>` : ''}
           <button class="stop" data-action="remove" data-id="${m.id}">Remove</button>
         </div>
@@ -319,7 +336,7 @@ async function refreshModels() {
     lastModels = shown;
     document.getElementById('idle-count').textContent = hiddenCount;
     if (!shown.length) {
-      list.innerHTML = `<div class="empty">${showAll ? 'No models tracked yet.' : 'No models are currently spending money.'}</div>`;
+      list.innerHTML = `<div class="empty">${showAll ? 'No models tracked yet.' : 'No models are currently spending money, starting up, or stuck.'}</div>`;
     } else {
       list.innerHTML = shown.map(modelRowHtml).join('');
     }
@@ -358,11 +375,15 @@ document.getElementById('models-list').addEventListener('click', async (e) => {
       `the model file on the shared volume is left alone.`)) return;
   btn.disabled = true;
   try {
-    if (action === 'start') await fetchJSON(`/api/models/${encodeURIComponent(id)}/start`, { method: 'POST' });
+    if (action === 'start') {
+      btn.textContent = 'Starting…';
+      await fetchJSON(`/api/models/${encodeURIComponent(id)}/start`, { method: 'POST' });
+    }
     if (action === 'start-with-gpu') {
       const sel = document.getElementById(`start-gpu-${id}`);
       const gpuId = sel ? sel.value : null;
       if (!gpuId) { alert('No GPU selected'); btn.disabled = false; return; }
+      btn.textContent = 'Starting…';
       await fetchJSON(`/api/models/${encodeURIComponent(id)}/start`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ gpu_id: gpuId }),

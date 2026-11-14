@@ -627,11 +627,19 @@ async def model_live_status(m: dict) -> dict:
     summary = workers.get("summary", {})
     active = summary.get("running", 0) + summary.get("initializing", 0) + summary.get("throttled", 0)
     price = gpu_price((m.get("gpu_type_ids") or [None])[0])
+    last_attempt = m.get("last_start_attempt")
+    # No worker yet, but Start was pressed recently enough that this is
+    # still the normal cold-start wait, not the "likely stuck" case
+    # _stuck_warning would flag — show that as its own "starting" state
+    # rather than lumping it in with "idle" (which, to someone who just
+    # clicked Start, looks exactly like nothing happened).
+    starting = active == 0 and last_attempt and (time.time() - last_attempt) < STUCK_WARNING_AFTER_SECONDS
     return {
         "spending": active > 0,
-        "state": "running" if active > 0 else "idle",
+        "state": "running" if active > 0 else ("starting" if starting else "idle"),
         "workers": summary,
         "est_cost_per_hr": round(price * active, 2) if price else 0,
+        "seconds_since_start": int(time.time() - last_attempt) if last_attempt else None,
         "warning": _stuck_warning(m, active),
     }
 
@@ -655,7 +663,7 @@ async def models_list(all: bool = False):
     for m in models:
         await _ensure_context_recommendation(m, models)
         status = await model_live_status(m)
-        if all or status["spending"]:
+        if all or status["spending"] or status["state"] == "starting" or status.get("warning"):
             out.append({**m, "status": status, "connection": model_connection_info(m)})
     return {"models": out, "total_tracked": len(models)}
 
