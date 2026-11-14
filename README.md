@@ -250,7 +250,10 @@ removing one never touches another's downloaded weights):
   settings.
 - **Stop** deletes that model's endpoint+template (file stays on the
   shared volume, so the next Start doesn't re-download); **Remove** does
-  the same and also forgets the model entirely.
+  the same and also forgets the model entirely. While a model is
+  **starting**, or stuck idle with a warning, a **Cancel start** button
+  replaces Stop — same underlying teardown, just surfaced during the
+  window where there's no worker yet to call "running".
 - **Auto-stop:** each model has an optional "stop after N minutes with no
   requests" setting (at Add time, or later from its expanded row). This is
   separate from — and on top of — Runpod's own worker-level `idleTimeout`,

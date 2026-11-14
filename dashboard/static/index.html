@@ -297,6 +297,7 @@ function modelRowHtml(m) {
   const gpu = (m.gpu_type_ids || [])[0] || '—';
   const spending = st.spending;
   const starting = st.state === 'starting';
+  const stuck = !spending && !!st.warning;
   const ready = !!(m.connection && m.connection.ready);
   const stateLabel = spending ? `running — ${fmtMoney2(st.est_cost_per_hr)}/hr` :
     starting ? startingLabel(st) : (st.state || 'stopped');
@@ -311,6 +312,7 @@ function modelRowHtml(m) {
         <div class="actions">
           ${(ready && !spending && !starting) ? `<button class="start" data-action="start" data-id="${m.id}">Start</button>` : ''}
           ${spending ? `<button class="stop" data-action="stop" data-id="${m.id}">Stop</button>` : ''}
+          ${(starting || stuck) ? `<button class="stop" data-action="cancel-start" data-id="${m.id}">Cancel start</button>` : ''}
           <button class="stop" data-action="remove" data-id="${m.id}">Remove</button>
         </div>
       </div>
@@ -398,6 +400,10 @@ document.getElementById('models-list').addEventListener('click', async (e) => {
       });
     }
     if (action === 'stop') await fetchJSON(`/api/models/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+    if (action === 'cancel-start') {
+      btn.textContent = 'Cancelling…';
+      await fetchJSON(`/api/models/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+    }
     if (action === 'remove') {
       delete gpuOptionsCache[id];
       await fetchJSON(`/api/models/${encodeURIComponent(id)}`, { method: 'DELETE' });
