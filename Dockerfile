@@ -42,16 +42,18 @@ RUN cmake -B build \
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip curl \
+    python3 python3-pip curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # llama-server is dynamically linked against sibling .so files built right
-# next to it (libllama-server-impl.so, libggml*.so, ...) via an $ORIGIN
-# rpath — copying only the executable leaves it unable to start at all
-# ("error while loading shared libraries: libllama-server-impl.so: cannot
-# open shared object file"). Copy the whole build/bin/ directory so every
-# sibling library lands alongside it.
+# next to it (libllama-server-impl.so, libggml*.so, ...), none of which are
+# on the default linker search path — copying only the executable, or
+# copying the libs without pointing the linker at them, both leave it
+# unable to start ("error while loading shared libraries:
+# libllama-server-impl.so: cannot open shared object file"). Copy the whole
+# build/bin/ directory and add it to LD_LIBRARY_PATH.
 COPY --from=builder /build/build/bin/ /usr/local/bin/
+ENV LD_LIBRARY_PATH=/usr/local/bin:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 COPY requirements.txt .
