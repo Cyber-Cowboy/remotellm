@@ -225,8 +225,7 @@ function escapeHtml(s) {
 }
 
 function stockLabel(status) {
-  if (!status) return '';
-  return ` — stock: ${status}`;
+  return ` (stock: ${status || 'unknown'})`;
 }
 
 function stockDotColor(status) {
@@ -240,7 +239,7 @@ function gpuSelectHtml(idPrefix, modelId, data) {
   if (!data) return `<div class="note">Loading GPU options…</div>`;
   const opts = data.options.map(o =>
     `<option value="${o.id}" ${o.id === data.recommended_id ? 'selected' : ''}>` +
-    `${o.id} — ${o.vram_gb}GB — ${fmtMoney2(o.price_hr)}/hr${o.fits ? '' : ' (too small)'}${stockLabel(o.stock_status)}</option>`
+    `${o.id} — ${o.vram_gb}GB — ${fmtMoney2(o.price_hr)}/hr${stockLabel(o.stock_status)}${o.fits ? '' : ' — too small'}</option>`
   ).join('');
   return `
     <div class="field">
@@ -457,7 +456,7 @@ function renderGpuOptions(options, recommendedId) {
   const sel = document.getElementById('add-gpu');
   sel.innerHTML = options.map(o =>
     `<option value="${o.id}" ${o.id === recommendedId ? 'selected' : ''}>` +
-    `${o.id} — ${o.vram_gb}GB — ${fmtMoney2(o.price_hr)}/hr${o.fits ? '' : ' (too small)'}${stockLabel(o.stock_status)}</option>`
+    `${o.id} — ${o.vram_gb}GB — ${fmtMoney2(o.price_hr)}/hr${stockLabel(o.stock_status)}${o.fits ? '' : ' — too small'}</option>`
   ).join('');
   document.getElementById('add-gpu-stock').innerHTML = gpuStockLegendHtml(options);
 }
