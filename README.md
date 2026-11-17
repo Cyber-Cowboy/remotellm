@@ -23,7 +23,7 @@ dashboard/ (FastAPI)                 <- checks auth, rate-limits, restricts CORS
    │  "model" field                     Runpod endpoint
    ▼
 Runpod Serverless Endpoint            <- Flex workers, workersMin=0 (Active Workers = 0)
-   │  idle -> 0 GPU workers, no billing   — one endpoint+template PER model
+   │  idle -> 0 GPU workers, no billing   — one endpoint PER model
    │  request arrives -> Runpod starts a worker automatically
    ▼
 Worker container (Dockerfile, src/handler.py)
@@ -61,23 +61,16 @@ a 48GB GPU at the cost of throughput). The dashboard's "Add a model" flow
 estimates this automatically from the real GGUF file size and recommends
 the cheapest GPU tier that fits — see §8.
 
-Indicative Runpod Serverless pricing (hand-checked against
-[runpod.io/pricing](https://www.runpod.io/pricing) — verify current rates
-before relying on these, they change):
+The dashboard's GPU picker fetches real-time prices and per-tier
+availability straight from Runpod's own catalog (`GET
+/v2/catalog/gpus?include=AVAILABILITY&product=SERVERLESS`) rather than a
+hardcoded table — nothing here goes stale. Roughly: 16GB-class cards
+start around $0.25/hr, 48GB-class (RTX A6000/A40/L40S) $0.6–1.1/hr,
+80GB-class (A100/H100) $2–4.5/hr, up through H200/B200 at $5–8/hr — see
+[runpod.io/pricing](https://www.runpod.io/pricing) for the current
+numbers, or just open the dashboard's picker.
 
-| GPU | VRAM | $/hr |
-|---|---|---|
-| RTX A4000 | 16GB | $0.58 |
-| L4 | 24GB | $0.75 |
-| RTX A6000 / A40 | 48GB | $1.22 |
-| L40S | 48GB | $1.89 |
-| A100 80GB | 80GB | $2.99 |
-| H100 | 80GB | $5.89 |
-| RTX PRO 6000 Blackwell | 96GB | $3.69 |
-| H200 | 141GB | $6.99 |
-| B200 | 180GB | $10.79 |
-
-At `workersMin=0`, you only pay for the seconds a worker is actually
+At `workers.min=0`, you only pay for the seconds a worker is actually
 running (cold start + generation + the `idleTimeout` tail), never for idle
 GPU time with no worker. The network volume itself has its own small,
 continuous storage cost regardless of whether a worker is running (see §9).
@@ -93,7 +86,7 @@ continuous storage cost regardless of whether a worker is running (see §9).
 │   ├── llama_runtime.py        # shared: download model once, launch+health-check llama-server
 │   └── handler.py              # Runpod generator handler: forwards/streams requests
 ├── deploy/
-│   └── create_infra.py         # creates the shared network volume + template + endpoint via API
+│   └── create_infra.py         # creates the shared network volume + a first endpoint via API
 ├── proxy/                       # standalone single-model OpenAI-compatible gateway (deploy anywhere)
 │   ├── main.py
 │   ├── requirements.txt
@@ -126,8 +119,8 @@ continuous storage cost regardless of whether a worker is running (see §9).
   ever add a gated model.
 
 None of these are stored anywhere in this repository — they live in a
-local `.env` (gitignored) and, at deploy time, in Runpod's own template
-env (never baked into the image or committed to git).
+local `.env` (gitignored) and, at deploy time, in the endpoint's own
+env on Runpod (never baked into the image or committed to git).
 
 ## 5. Build and push the worker image
 
@@ -148,9 +141,9 @@ bash deploy.sh
 
 Creates, in order: a container registry auth (so Runpod can pull a private
 image), a Network Volume (persistent model storage, shared by every model
-you'll add later), a Serverless Template, and a first Serverless Endpoint
-with `workersMin=0`, `workersMax=1`, Flex workers, `idleTimeout=60`,
-`flashboot=true`, attached to the volume. Re-running it reuses whatever
+you'll add later), and a first Serverless Endpoint with `workers.min=0`,
+`workers.max=1`, Flex workers, `idleTimeout=60`, `flashboot=FLASHBOOT`,
+attached to the volume. Re-running it reuses whatever
 already exists (tracked in `deploy/infra_state.json` — delete that file to
 force fresh resources). After this, use the dashboard (§8) to add/start/stop
 models — it reuses the volume this creates.
@@ -167,17 +160,24 @@ against older examples:**
   PCIe"` (Runpod returns the full valid enum list on a 400 if you guess
   wrong).
 - **The job API (`/run`, `/runsync`, `/status`, `/stream`, `/health`) is at
-  `api.runpod.ai`** — not `api.runpod.io`, which is only the management
-  REST API (`/v1/endpoints`, `/v1/networkvolumes`, etc.). Mixing these up
-  gives a silent 404, not an auth error. `proxy/main.py`,
+  `api.runpod.ai`** — not `api.runpod.io`, which is the management REST
+  API (`/v2/serverless`, `/v2/network-volumes`, etc.) and GraphQL.
+  Mixing these up gives a silent 404, not an auth error. `proxy/main.py`,
   `scripts/test_endpoint.sh`, and `dashboard/main.py` all use the correct
   host.
-- A Runpod template name must be unique, and a **deleted endpoint's
-  template stays "pending cleanup" (reserving its name) for up to ~90
-  minutes** — a template named purely from the model's served name
-  collides on the very next Stop → Start within that window ("Template
-  name must be unique"). The dashboard suffixes every template/endpoint
-  name with a timestamp specifically to avoid this.
+- **Runpod retired REST API v1 (`rest.runpod.io`) entirely on
+  2026-11-15** — it stopped resolving in DNS, not just erroring, which
+  first showed up here as a bare "Internal Server Error" on Start with
+  no explanation. Migrated to v2 (`api.runpod.io/v2`): no more separate
+  Template resource (image/env/ports go straight on the endpoint, so the
+  old "deleted endpoint's template stays pending-cleanup for ~90 minutes,
+  colliding with the next Stop → Start" bug is gone by construction), and
+  GPUs are selected by named **pool** (e.g. `AMPERE_48`) rather than a
+  literal id — the dashboard still shows literal ids in its picker and
+  resolves each to its pool via the live catalog (`GET
+  /v2/catalog/gpus`) when actually calling the API. GraphQL
+  (`api.runpod.io/graphql`) is unaffected by this and has its own,
+  later retirement planned for early 2027.
 - A freshly created endpoint shows one worker in `idle`/`ready` state via
   `/health` even before you send a request — this is Runpod's flashboot
   **standby** worker (not client-configurable; `workersStandby` isn't a
@@ -197,10 +197,10 @@ against older examples:**
 ## 7. Tearing everything down
 
 ```bash
-curl -X DELETE https://rest.runpod.io/v1/endpoints/<endpoint_id> -H "Authorization: Bearer $RUNPOD_API_KEY"
-curl -X DELETE https://rest.runpod.io/v1/templates/<template_id> -H "Authorization: Bearer $RUNPOD_API_KEY"
-curl -X DELETE https://rest.runpod.io/v1/networkvolumes/<volume_id> -H "Authorization: Bearer $RUNPOD_API_KEY"
+curl -X DELETE https://api.runpod.io/v2/serverless/<endpoint_id> -H "Authorization: Bearer $RUNPOD_API_KEY"
+curl -X DELETE https://api.runpod.io/v2/network-volumes/<volume_id> -H "Authorization: Bearer $RUNPOD_API_KEY"
 ```
+(No separate template to delete — v2 has none, see "Known limitations".)
 IDs are in `deploy/infra_state.json` and `dashboard/models.json`. Deleting
 the network volume is what stops the ongoing storage charge. The dashboard's
 "Delete everything" button (§8) does all of this for every tracked model in
@@ -214,13 +214,13 @@ bash scripts/run_dashboard.sh
 # open http://localhost:8787
 ```
 
-Run **several models side by side**, each its own Runpod endpoint+template,
+Run **several models side by side**, each its own Runpod endpoint,
 all sharing one network volume (one subfolder per model, so adding or
 removing one never touches another's downloaded weights):
 
 - **Runpod account:** live balance + `$/hr` spend, and a **"Delete
   everything"** button that tears down every tracked model's
-  endpoint+template plus the shared volume — nothing left billing, not even
+  endpoint plus the shared volume — nothing left billing, not even
   storage.
 - **Models currently spending money:** the default view shows only models
   that actually have a GPU running right now (not every model you've ever
@@ -232,15 +232,14 @@ removing one never touches another's downloaded weights):
   context length straight from the GGUF's own metadata via Hugging Face's
   API (`?expand[]=gguf` — GGUF-only repos usually don't publish a
   `config.json`, but the GGUF metadata is always there), then shows every
-  Runpod GPU tier with its real `$/hr` price, pre-selecting the cheapest
+  Runpod GPU tier with its real, live `$/hr` price (straight from
+  `GET /v2/catalog/gpus`, never hardcoded), pre-selecting the cheapest
   one that fits. Pick a different tier if you want, optionally override
   the context window, then **Deploy**. Next to the picker, a color-coded
-  line shows each tier's current Runpod stock status (High/Medium/Low) —
-  this is Runpod's global signal, not scoped to `RUNPOD_DATA_CENTER`;
-  Runpod's API accepts a `dataCenterId` filter on this field but always
-  returns `null` for it regardless of the id given, so no real
-  per-region breakdown is available. Still useful as an early warning
-  before picking a tier that's likely to sit `IN_QUEUE` (see §6).
+  line shows each tier's current Runpod stock status (HIGH/MEDIUM/LOW/
+  NONE — the catalog's own live `availability` field, global rather than
+  scoped to `RUNPOD_DATA_CENTER`) as an early warning before picking a
+  tier that's likely to sit `IN_QUEUE` (see §6).
 - **Click any model row** to expand it. A model with no live endpoint shows
   a **GPU picker with price** and a **Start** button right there — starting
   (or restarting after Stop) a model always means choosing hardware
@@ -254,29 +253,30 @@ removing one never touches another's downloaded weights):
   field, so you never need a different URL per model. This is what to put
   into AnythingLLM or any OpenAI-compatible client's "Generic OpenAI"
   settings.
-- **Stop** deletes that model's endpoint+template (file stays on the
+- **Stop** deletes that model's endpoint (file stays on the
   shared volume, so the next Start doesn't re-download); **Remove** does
   the same and also forgets the model entirely. While a model is
   **starting**, or stuck idle with a warning, a **Cancel start** button
   replaces Stop — same underlying teardown, just surfaced during the
   window where there's no worker yet to call "running".
-- **Fast start:** next to the normal Start button, races the cheapest
-  `FAST_START_MAX_TIERS` (10 — effectively every distinct tier right now)
-  GPU tiers that fit the model at once instead of waiting out one tier
-  at a time — useful when a specific tier's
-  capacity is empty (see above) but another isn't. A background check
-  every `BACKGROUND_CHECK_INTERVAL_SECONDS` (15s) keeps whichever tier
-  gets a worker first and tears the rest down; Cancel start/Stop/Remove
-  all tear down every raced candidate, not just the winner. If more than
-  one tier happens to get capacity around the same time, you're briefly
-  billed for more than one GPU until the next check catches it — the
-  confirmation dialog says so before it starts anything.
+- **Fast start:** next to the normal Start button, creates *one* endpoint
+  whose `gpu.pools` spans the cheapest `FAST_START_MAX_TIERS` (10 —
+  effectively every distinct tier right now) GPU tiers that fit the
+  model, instead of waiting out one tier at a time — useful when a
+  specific tier's capacity is empty (see above) but another isn't.
+  Runpod schedules the endpoint's one worker onto whichever pool has
+  capacity first; since there's only ever one worker slot, unlike an
+  earlier v1-era design that raced separate endpoints, there is no way
+  to end up paying for more than one GPU at once — the only tradeoff is
+  that the actual price depends on which tier it lands in, which the
+  confirmation dialog says up front.
 - **Auto-stop:** each model has an optional "stop after N minutes with no
   requests" setting (at Add time, or later from its expanded row). This is
   separate from — and on top of — Runpod's own worker-level `idleTimeout`,
   which only scales the GPU to zero and leaves the endpoint itself sitting
-  there; auto-stop tears the endpoint+template down entirely, the same as
-  a manual Stop, checked by a background loop every 60s. Off by default.
+  there; auto-stop tears the endpoint down entirely, the same as
+  a manual Stop, checked by a background loop every
+  `BACKGROUND_CHECK_INTERVAL_SECONDS` (15s). Off by default.
 
 `gpuCount` is fixed at 1 — there's no multi-GPU tensor-split, so a model
 whose estimated VRAM exceeds the biggest single GPU (~180GB, B200) genuinely

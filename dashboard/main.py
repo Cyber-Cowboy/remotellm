@@ -259,117 +259,110 @@ async def fetch_context_recommendation(repo_id: str) -> tuple[int | None, int | 
 
 
 # ----------------------------------------------------- GPU / cost data --
-# Real per-GPU prices, hand-checked against Runpod's own Serverless
-# pricing page — update this if/when Runpod changes them, it's not
-# fetched live.
+# Runpod retired REST API v1 (rest.runpod.io) on 2026-11-15; this panel
+# used to hand-maintain prices against the v1-era pricing page, but the
+# v2 catalog endpoint (GET /v2/catalog/gpus) now hands back id, pool,
+# vram, live on-demand price AND live availability in one call — no
+# reason to hardcode any of it anymore, see runpod_gpu_catalog() below.
 
-RUNPOD_GPU_CATALOG = [
-    {"id": "NVIDIA RTX A4000", "vram_gb": 16, "price_hr": 0.58},
-    {"id": "NVIDIA L4", "vram_gb": 24, "price_hr": 0.75},
-    {"id": "NVIDIA RTX A6000", "vram_gb": 48, "price_hr": 1.22},
-    {"id": "NVIDIA A40", "vram_gb": 48, "price_hr": 1.22},
-    {"id": "NVIDIA L40S", "vram_gb": 48, "price_hr": 1.89},
-    {"id": "NVIDIA A100 80GB PCIe", "vram_gb": 80, "price_hr": 2.99},
-    {"id": "NVIDIA A100-SXM4-80GB", "vram_gb": 80, "price_hr": 2.99},
-    {"id": "NVIDIA H100 PCIe", "vram_gb": 80, "price_hr": 5.89},
-    {"id": "NVIDIA H100 80GB HBM3", "vram_gb": 80, "price_hr": 5.89},
-    {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "vram_gb": 96, "price_hr": 3.69},
-    {"id": "NVIDIA H200", "vram_gb": 141, "price_hr": 6.99},
-    {"id": "NVIDIA B200", "vram_gb": 180, "price_hr": 10.79},
-]
+_gpu_catalog_cache: dict = {"at": 0.0, "data": []}
+GPU_CATALOG_CACHE_SECONDS = 60
 
 
-def gpu_price(gpu_id: str) -> float | None:
-    for g in RUNPOD_GPU_CATALOG:
+async def runpod_gpu_catalog() -> list[dict]:
+    """Live GPU catalog, cheapest first: id (the same literal values the
+    picker has always shown, e.g. "NVIDIA RTX A6000"), its pool (the unit
+    Runpod's v2 endpoint API actually selects workers on — see
+    runpod_gpu_pool_for()), vram_gb, on-demand price_hr, and live
+    `availability` (NONE/LOW/MEDIUM/HIGH — replaces the old separate
+    GraphQL stockStatus query, this is the same signal straight from the
+    source). GPUs with no pool (not serverless-selectable) or no secure
+    on-demand price are left out."""
+    now = time.time()
+    if now - _gpu_catalog_cache["at"] < GPU_CATALOG_CACHE_SECONDS and _gpu_catalog_cache["data"]:
+        return _gpu_catalog_cache["data"]
+    if not RUNPOD_API_KEY:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://api.runpod.io/v2/catalog/gpus",
+                params={"include": "AVAILABILITY", "product": "SERVERLESS"},
+                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+            )
+            r.raise_for_status()
+            rows = r.json()["gpus"]
+    except httpx.HTTPError as e:
+        log.warning("couldn't fetch GPU catalog: %s", e)
+        return _gpu_catalog_cache["data"]
+    catalog = sorted(
+        (
+            {"id": g["id"], "pool": g["pool"], "vram_gb": g["memory"],
+             "price_hr": g["price"]["secure"], "availability": g.get("availability")}
+            for g in rows
+            if g.get("pool") and g.get("price", {}).get("secure") is not None
+        ),
+        key=lambda g: g["price_hr"],
+    )
+    _gpu_catalog_cache["at"] = now
+    _gpu_catalog_cache["data"] = catalog
+    return catalog
+
+
+async def gpu_price(gpu_id: str) -> float | None:
+    for g in await runpod_gpu_catalog():
         if g["id"] == gpu_id:
             return g["price_hr"]
     return None
 
 
-def gpu_options_for(required_gb: float | None) -> dict:
+async def gpu_options_for(required_gb: float | None) -> dict:
+    catalog = await runpod_gpu_catalog()
     options = []
     recommended_id = None
-    for g in RUNPOD_GPU_CATALOG:
+    for g in catalog:
         fits = required_gb is not None and required_gb <= g["vram_gb"]
-        options.append({**g, "fits": fits})
+        options.append({**g, "fits": fits, "stock_status": g["availability"]})
         if fits and recommended_id is None:
             recommended_id = g["id"]
-    fits_any = required_gb is None or required_gb <= RUNPOD_GPU_CATALOG[-1]["vram_gb"]
-    if recommended_id is None:
-        recommended_id = RUNPOD_GPU_CATALOG[-1]["id"]  # nothing fits — still pick *something*, flagged by fits_any
+    fits_any = required_gb is None or (bool(catalog) and required_gb <= max(g["vram_gb"] for g in catalog))
+    if recommended_id is None and catalog:
+        recommended_id = catalog[-1]["id"]  # nothing fits — still pick *something*, flagged by fits_any
     return {"options": options, "recommended_id": recommended_id, "fits_any": fits_any}
 
 
-async def gpu_options_with_stock(required_gb: float | None) -> dict:
-    result = gpu_options_for(required_gb)
-    stock = await runpod_gpu_stock()
-    for opt in result["options"]:
-        opt["stock_status"] = stock.get(opt["id"])
-    return result
+FAST_START_MAX_TIERS = 10  # cap simultaneous endpoints — more pools means more
+# risk of briefly paying for more than one GPU before the race is settled
 
 
-FAST_START_MAX_TIERS = 10  # cap simultaneous endpoints — more tiers means more
-# risk of briefly paying for more than one GPU before the race is settled.
-# There are only 9 distinct (vram, price) tiers in RUNPOD_GPU_CATALOG right
-# now, so 10 effectively means "race every tier that fits".
-
-
-def fast_start_tiers_for(required_gb: float | None, max_tiers: int = FAST_START_MAX_TIERS) -> list[str]:
-    """One representative GPU id per distinct (vram, price) tier that fits
-    this model, cheapest first, capped at max_tiers. runpod_gpu_ids_for()
-    already pulls in the rest of a tier's same-price SKUs as fallbacks, so
-    one id per tier is enough to race the tier itself."""
-    seen_tiers: set[tuple[int, float]] = set()
+async def fast_start_tiers_for(required_gb: float | None, max_tiers: int = FAST_START_MAX_TIERS) -> list[str]:
+    """One representative GPU id per distinct pool that fits this model,
+    cheapest first, capped at max_tiers. runpod_gpu_pool_for() races the
+    whole pool anyway, so one id per pool is enough to represent it."""
+    seen_pools: set[str] = set()
     reps: list[str] = []
-    for g in sorted(RUNPOD_GPU_CATALOG, key=lambda g: g["price_hr"]):
+    for g in await runpod_gpu_catalog():
         if required_gb is not None and required_gb > g["vram_gb"]:
             continue
-        tier = (g["vram_gb"], g["price_hr"])
-        if tier in seen_tiers:
+        if g["pool"] in seen_pools:
             continue
-        seen_tiers.add(tier)
+        seen_pools.add(g["pool"])
         reps.append(g["id"])
         if len(reps) >= max_tiers:
             break
     return reps
 
 
-# A few more real Runpod enum values at the same VRAM tier *and* price as
-# something in RUNPOD_GPU_CATALOG, not listed there separately, but worth
-# trying as fallbacks too — same reasoning as the catalog-derived groups
-# below. Keyed the same way: (vram_gb, price_hr).
-_RUNPOD_EXTRA_TIER_SKUS = {
-    (48, 1.22): ["NVIDIA RTX 6000 Ada Generation", "NVIDIA L40"],
-}
-
-
-def _runpod_tier_groups() -> list[list[str]]:
-    # Grouped by (vram_gb, price_hr), not just vram_gb — A100 and H100 are
-    # both "80GB" but very different prices, and silently falling back
-    # from one to the other would mean paying ~2x what the cost estimate
-    # shown before deploying said, without the user ever agreeing to it.
-    by_tier: dict[tuple[int, float], list[str]] = {}
-    for g in RUNPOD_GPU_CATALOG:
-        by_tier.setdefault((g["vram_gb"], g["price_hr"]), []).append(g["id"])
-    for tier, extra in _RUNPOD_EXTRA_TIER_SKUS.items():
-        by_tier.setdefault(tier, []).extend(extra)
-    return list(by_tier.values())
-
-
-def runpod_gpu_ids_for(gpu_id: str) -> list[str]:
-    """Every same-VRAM-tier SKU as a fallback list, not just the one the
-    user picked. Found by hand, twice, on two different tiers (RTX A4000,
-    then RTX A6000): Runpod's own capacity varies by exact SKU within a
-    data center, and a deploy with only one GPU id can sit at zero
-    workers forever — IN_QUEUE, no initializing/running/throttled, nothing
-    — if that SKU has none available right now. The API accepts the
-    request either way, so this looks identical to the Start button being
-    broken. Passing every same-tier id costs nothing extra (billed at
-    whichever one actually gets scheduled) and makes it much less likely."""
-    for group in _runpod_tier_groups():
-        if gpu_id in group:
-            return group
-    return [gpu_id]
+async def runpod_gpu_pool_for(gpu_id: str) -> str:
+    """The pool a chosen GPU id belongs to — what the v2 endpoint API
+    actually selects workers on (`gpu: {"pools": [...]}`). Runpod places
+    a worker on *any* card with capacity inside that pool, which is the
+    same same-tier fallback behavior this panel used to hand-build by
+    grouping the old hardcoded catalog by (vram, price)."""
+    for g in await runpod_gpu_catalog():
+        if g["id"] == gpu_id:
+            return g["pool"]
+    raise HTTPException(status_code=400, detail=f"unknown Runpod GPU id: {gpu_id!r}")
 
 
 class ResolveRequest(BaseModel):
@@ -392,7 +385,7 @@ async def models_resolve(req: ResolveRequest):
         "estimated_vram_gb": round(required_gb, 1) if required_gb else None,
         "recommended_context_window": ctx,
         "recommended_max_tokens": max_tokens,
-        **(await gpu_options_with_stock(required_gb)),
+        **(await gpu_options_for(required_gb)),
     }
 
 
@@ -417,41 +410,6 @@ async def runpod_account() -> dict:
         return {"error": f"couldn't reach Runpod: {e}"}
 
 
-_gpu_stock_cache: dict = {"at": 0.0, "data": {}}
-GPU_STOCK_CACHE_SECONDS = 30
-
-
-async def runpod_gpu_stock() -> dict[str, str | None]:
-    """Runpod's own "High"/"Medium"/"Low" stock signal per GPU id, from the
-    same GraphQL field used to diagnose real capacity shortages during
-    development (see README "Known limitations"). There's no working
-    per-data-center breakdown — passing dataCenterId to lowestPrice makes
-    stockStatus come back null instead of filtered, confirmed by hand — so
-    this is Runpod's global figure, the best available proxy for "will
-    this GPU actually start", not specific to RUNPOD_DATA_CENTER."""
-    now = time.time()
-    if now - _gpu_stock_cache["at"] < GPU_STOCK_CACHE_SECONDS and _gpu_stock_cache["data"]:
-        return _gpu_stock_cache["data"]
-    if not RUNPOD_API_KEY:
-        return {}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                "https://api.runpod.io/graphql",
-                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
-                json={"query": "query { gpuTypes { id lowestPrice(input:{gpuCount:1}){ stockStatus } } }"},
-            )
-            r.raise_for_status()
-            rows = r.json()["data"]["gpuTypes"]
-    except Exception as e:
-        log.warning("couldn't fetch GPU stock status: %s", e)
-        return _gpu_stock_cache["data"]
-    data = {row["id"]: (row.get("lowestPrice") or {}).get("stockStatus") for row in rows}
-    _gpu_stock_cache["at"] = now
-    _gpu_stock_cache["data"] = data
-    return data
-
-
 async def runpod_workers(endpoint_id: str) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -471,8 +429,23 @@ async def runpod_workers(endpoint_id: str) -> dict | None:
         return None
 
 
+async def _runpod_pools_for(gpu_ids: list[str]) -> list[str]:
+    """Distinct pools for a list of GPU ids, in order — v2's gpu.pools
+    accepts several at once and schedules the endpoint's one worker onto
+    whichever has capacity first. That's what fast-start uses to race
+    several tiers inside a single endpoint (no separate endpoints, so no
+    way to end up paying for more than one GPU at once); a normal Start
+    just passes a single id, becoming a one-pool list."""
+    pools: list[str] = []
+    for gpu_id in gpu_ids:
+        pool = await runpod_gpu_pool_for(gpu_id)
+        if pool not in pools:
+            pools.append(pool)
+    return pools
+
+
 async def runpod_create_model(served_name: str, repo: str, filename: str, gpu_ids: list[str],
-                               context_window: int | None = None, name_suffix: str = "") -> dict:
+                               context_window: int | None = None) -> dict:
     state = load_state()
     network_volume_id = state.get("network_volume_id")
     registry_auth_id = state.get("registry_auth_id")
@@ -483,6 +456,7 @@ async def runpod_create_model(served_name: str, repo: str, filename: str, gpu_id
         )
     if not DOCKERHUB_USERNAME:
         raise HTTPException(status_code=400, detail="DOCKERHUB_USERNAME not set")
+    pools = await _runpod_pools_for(gpu_ids)
 
     env = {
         "SERVED_MODEL_NAME": served_name,
@@ -495,70 +469,53 @@ async def runpod_create_model(served_name: str, repo: str, filename: str, gpu_id
         "MAX_CONCURRENT": os.environ.get("MAX_CONCURRENT", "2"),
     }
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}"}
+    body = {
+        # v1 held a deleted endpoint's template "pending cleanup" for up
+        # to ~90 minutes, colliding with a purely served_name-derived
+        # name on the next Stop -> Start; a short suffix sidesteps it. v2
+        # has no separate template at all — image/env/ports go straight
+        # on the endpoint.
+        "name": f"gptoss-{served_name}-{int(time.time())}",
+        "image": f"docker.io/{DOCKERHUB_USERNAME}/gptoss-120b-worker:latest",
+        "type": "QUEUE",
+        "disk": 20,
+        "ports": ["8080/http"],
+        "env": env,
+        "gpu": {"pools": pools},
+        "workers": {"min": 0, "max": 1, "idleTimeout": RUNPOD_IDLE_TIMEOUT_SECONDS},
+        "scaling": {"type": "QUEUE_DELAY", "queueDelay": 1},
+        "flashboot": "FLASHBOOT",
+        "mounts": {"network": [{"volumeId": network_volume_id}]},
+    }
+    if registry_auth_id:
+        body["registry"] = registry_auth_id
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            tmpl_body = {
-                # Runpod holds a deleted endpoint's template "pending cleanup"
-                # for up to ~90 minutes before its name is free again — a
-                # purely served_name-derived name collides on the very next
-                # Stop -> Start within that window ("Template name must be
-                # unique"). A short suffix sidesteps it rather than hoping
-                # the timing never lines up.
-                "name": f"gptoss-{served_name}-template-{int(time.time())}{name_suffix}",
-                "imageName": f"docker.io/{DOCKERHUB_USERNAME}/gptoss-120b-worker:latest",
-                "category": "NVIDIA", "isServerless": True, "containerDiskInGb": 20,
-                "ports": ["8080/http"], "env": env,
-            }
-            if registry_auth_id:
-                tmpl_body["containerRegistryAuthId"] = registry_auth_id
-            tmpl = await client.post("https://rest.runpod.io/v1/templates", headers=headers, json=tmpl_body)
-            if tmpl.status_code >= 400:
-                raise HTTPException(status_code=502, detail=f"template create failed: {tmpl.text}")
-            template_id = tmpl.json()["id"]
-
-            ep_body = {
-                "name": f"gptoss-{served_name}-{int(time.time())}{name_suffix}",
-                "templateId": template_id,
-                "computeType": "GPU",
-                "gpuTypeIds": gpu_ids,
-                "gpuCount": 1,
-                "workersMin": 0,
-                "workersMax": 1,
-                "idleTimeout": RUNPOD_IDLE_TIMEOUT_SECONDS,
-                "flashboot": True,
-                "networkVolumeId": network_volume_id,
-                "scalerType": "QUEUE_DELAY",
-                "scalerValue": 1,
-            }
-            ep = await client.post("https://rest.runpod.io/v1/endpoints", headers=headers, json=ep_body)
+            ep = await client.post("https://api.runpod.io/v2/serverless", headers=headers, json=body)
             if ep.status_code >= 400:
                 raise HTTPException(status_code=502, detail=f"endpoint create failed: {ep.text}")
             endpoint_id = ep.json()["id"]
     except httpx.HTTPError as e:
-        # rest.runpod.io (template/endpoint management) is a separate
-        # subdomain from api.runpod.io (GraphQL) and api.runpod.ai (job
-        # API) — seen in practice to have its own outages (DNS not
-        # resolving at all) while the other two stayed up. Surface that
-        # as a clear 502 instead of an unhandled 500.
-        raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API (rest.runpod.io): {e}")
-    return {"template_id": template_id, "endpoint_id": endpoint_id}
+        raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API: {e}")
+    return {"endpoint_id": endpoint_id}
 
 
-async def runpod_retarget_gpu(template_id: str, endpoint_id: str, gpu_ids: list[str]) -> None:
-    """Switch an existing endpoint to a different GPU tier in place — no
+async def runpod_retarget_gpu(endpoint_id: str, gpu_ids: list[str]) -> None:
+    """Switch an existing endpoint to different GPU pool(s) in place — no
     need to delete/recreate, which would briefly drop the model off the
     "tracked" list for no reason."""
+    pools = await _runpod_pools_for(gpu_ids)
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}"}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.patch(
-                f"https://rest.runpod.io/v1/endpoints/{endpoint_id}",
-                headers=headers, json={"gpuTypeIds": gpu_ids},
+                f"https://api.runpod.io/v2/serverless/{endpoint_id}",
+                headers=headers, json={"gpu": {"pools": pools}},
             )
             if r.status_code >= 400:
                 raise HTTPException(status_code=502, detail=f"GPU retarget failed: {r.text}")
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API (rest.runpod.io): {e}")
+        raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API: {e}")
 
 
 async def _warm_runpod(endpoint_id: str, served_name: str) -> dict:
@@ -585,26 +542,26 @@ async def _warm_runpod(endpoint_id: str, served_name: str) -> dict:
         return {"submitted": False, "error": f"couldn't reach Runpod to submit the warm-up job: {e}"}
 
 
-async def runpod_delete_endpoint_template(endpoint_id: str | None, template_id: str | None) -> None:
+async def runpod_delete_endpoint(endpoint_id: str | None) -> None:
+    if not endpoint_id:
+        return
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            for rid, path in ((endpoint_id, "endpoints"), (template_id, "templates")):
-                if rid:
-                    await client.delete(
-                        f"https://rest.runpod.io/v1/{path}/{rid}",
-                        headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
-                    )
+            await client.delete(
+                f"https://api.runpod.io/v2/serverless/{endpoint_id}",
+                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+            )
     except httpx.HTTPError as e:
         # Left not-torn-down on Runpod's side rather than marked stopped
         # here while still live there — callers clear local state only
         # after this returns, so a failed delete surfaces instead of
         # silently losing track of a still-billing endpoint.
-        raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API (rest.runpod.io) to delete: {e}")
+        raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API to delete: {e}")
 
 
 async def runpod_delete_model(m: dict) -> None:
     rp = m.get("runpod") or {}
-    await runpod_delete_endpoint_template(rp.get("endpoint_id"), rp.get("template_id"))
+    await runpod_delete_endpoint(rp.get("endpoint_id"))
 
 
 async def _check_auto_stop() -> None:
@@ -634,54 +591,12 @@ async def _check_auto_stop() -> None:
         save_models(models)
 
 
-async def _check_fast_start_races() -> None:
-    """A fast-started model raced several GPU tiers at once (see
-    /api/models/{id}/fast-start). As soon as any candidate has an active
-    worker, keep that one as the model's real endpoint and tear the rest
-    down — checked every BACKGROUND_CHECK_INTERVAL_SECONDS so a double
-    win (more than one tier getting capacity around the same time) only
-    briefly double-bills instead of indefinitely."""
-    models = load_models()
-    changed = False
-    for m in models:
-        race = m.get("racing")
-        if not race:
-            continue
-        winner = None
-        for cand in race:
-            workers = await runpod_workers(cand["endpoint_id"])
-            if not workers:
-                continue
-            summary = workers.get("summary", {})
-            active = summary.get("running", 0) + summary.get("initializing", 0) + summary.get("throttled", 0)
-            if active > 0:
-                winner = cand
-                break
-        if not winner:
-            continue
-        log.warning("Fast-start race for %s won by %s", m["id"], winner["gpu_id"])
-        for cand in race:
-            if cand is winner:
-                continue
-            await runpod_delete_endpoint_template(cand.get("endpoint_id"), cand.get("template_id"))
-        m["runpod"] = {"template_id": winner["template_id"], "endpoint_id": winner["endpoint_id"]}
-        m["gpu_type_ids"] = [winner["gpu_id"]]
-        m["racing"] = None
-        changed = True
-    if changed:
-        save_models(models)
-
-
 async def _background_loop() -> None:
     while True:
         try:
             await _check_auto_stop()
         except Exception as e:  # noqa: BLE001 — one bad check must not kill the loop
             log.warning("auto-stop check failed: %s", e)
-        try:
-            await _check_fast_start_races()
-        except Exception as e:  # noqa: BLE001
-            log.warning("fast-start race check failed: %s", e)
         await asyncio.sleep(BACKGROUND_CHECK_INTERVAL_SECONDS)
 
 
@@ -705,8 +620,6 @@ async def runpod_teardown():
     models = load_models()
     deleted_models = []
     for m in models:
-        for cand in (m.get("racing") or []):
-            await runpod_delete_endpoint_template(cand.get("endpoint_id"), cand.get("template_id"))
         await runpod_delete_model(m)
         deleted_models.append(m["id"])
     state = load_state()
@@ -715,13 +628,13 @@ async def runpod_teardown():
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.delete(
-                    f"https://rest.runpod.io/v1/networkvolumes/{volume_id}",
+                    f"https://api.runpod.io/v2/network-volumes/{volume_id}",
                     headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
                 )
                 if r.status_code not in (200, 204, 404):
                     raise HTTPException(status_code=502, detail=f"volume delete failed: {r.text}")
         except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API (rest.runpod.io): {e}")
+            raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API: {e}")
     save_state({})
     save_models([])
     log.warning("Runpod full teardown: removed models %s + shared volume", deleted_models)
@@ -769,34 +682,6 @@ def _stuck_warning(m: dict, active_count: int) -> str | None:
 
 async def model_live_status(m: dict) -> dict:
     endpoint_id = (m.get("runpod") or {}).get("endpoint_id")
-    race = m.get("racing")
-    if race and not endpoint_id:
-        # Not resolved yet (see _check_fast_start_races) — report every
-        # candidate's own worker count so the UI can show the race itself,
-        # not just "starting" with no detail on which tiers are ahead.
-        details = []
-        for cand in race:
-            workers = await runpod_workers(cand["endpoint_id"])
-            active = 0
-            if workers:
-                summary = workers.get("summary", {})
-                active = summary.get("running", 0) + summary.get("initializing", 0) + summary.get("throttled", 0)
-            details.append({"gpu_id": cand["gpu_id"], "active": active})
-        spending_now = sum(gpu_price(d["gpu_id"]) or 0 for d in details if d["active"] > 0)
-        last_attempt = m.get("last_start_attempt")
-        warning = None
-        if spending_now == 0 and last_attempt and time.time() - last_attempt > STUCK_WARNING_AFTER_SECONDS:
-            warning = (f"Still 0 workers across all {len(race)} raced tiers "
-                       f"{int(time.time() - last_attempt)}s after fast-start — Runpod capacity may be low "
-                       f"across the board right now. Cancel start, then try Start with a specific GPU instead.")
-        return {
-            "spending": spending_now > 0,
-            "state": "racing",
-            "racing": details,
-            "est_cost_per_hr": round(spending_now, 2),
-            "seconds_since_start": int(time.time() - last_attempt) if last_attempt else None,
-            "warning": warning,
-        }
     if not endpoint_id:
         return {"spending": False, "state": "stopped", "est_cost_per_hr": 0}
     workers = await runpod_workers(endpoint_id)
@@ -804,7 +689,16 @@ async def model_live_status(m: dict) -> dict:
         return {"spending": False, "state": "stopped", "est_cost_per_hr": 0}
     summary = workers.get("summary", {})
     active = summary.get("running", 0) + summary.get("initializing", 0) + summary.get("throttled", 0)
-    price = gpu_price((m.get("gpu_type_ids") or [None])[0])
+    # A fast-started model's endpoint can span several GPU tiers at once
+    # (gpu.pools) — ask the worker itself which one it actually landed on
+    # rather than guessing from gpu_type_ids[0], which is only accurate
+    # for a single-tier Start.
+    active_gpu_id = next(
+        (w.get("gpuTypeId") for w in workers.get("workers", [])
+         if w.get("status") in ("RUNNING", "INITIALIZING", "THROTTLED")),
+        None,
+    )
+    price = await gpu_price(active_gpu_id or (m.get("gpu_type_ids") or [None])[0])
     last_attempt = m.get("last_start_attempt")
     # No worker yet, but Start was pressed recently enough that this is
     # still the normal cold-start wait, not the "likely stuck" case
@@ -841,7 +735,7 @@ async def models_list(all: bool = False):
     for m in models:
         await _ensure_context_recommendation(m, models)
         status = await model_live_status(m)
-        if all or status["spending"] or status["state"] in ("starting", "racing") or status.get("warning"):
+        if all or status["spending"] or status["state"] == "starting" or status.get("warning"):
             out.append({**m, "status": status, "connection": model_connection_info(m)})
     return {"models": out, "total_tracked": len(models)}
 
@@ -863,12 +757,12 @@ async def models_gpu_options(model_id: str):
             required_gb = round(size_bytes / 1e9 * 1.15 + 2, 1)
             m["estimated_vram_gb"] = required_gb
             save_models(models)
-    return {"estimated_vram_gb": required_gb, **(await gpu_options_with_stock(required_gb))}
+    return {"estimated_vram_gb": required_gb, **(await gpu_options_for(required_gb))}
 
 
 @app.post("/api/models")
 async def models_add(req: AddModelRequest):
-    if gpu_price(req.gpu_id) is None:
+    if await gpu_price(req.gpu_id) is None:
         raise HTTPException(status_code=400, detail=f"unknown Runpod GPU id: {req.gpu_id!r}")
 
     repo_id, filename, size_bytes = await resolve_hf_model(req.hf_url)
@@ -894,8 +788,7 @@ async def models_add(req: AddModelRequest):
         "auto_stop_minutes": req.auto_stop_minutes,
         "created_at": time.time(),
     }
-    entry["runpod"] = await runpod_create_model(served_name, repo_id, filename,
-                                                  runpod_gpu_ids_for(req.gpu_id), context_window)
+    entry["runpod"] = await runpod_create_model(served_name, repo_id, filename, [req.gpu_id], context_window)
 
     models.append(entry)
     save_models(models)
@@ -909,9 +802,6 @@ async def models_stop(model_id: str):
     m = next((x for x in models if x["id"] == model_id), None)
     if not m:
         raise HTTPException(status_code=404, detail="model not found")
-    for cand in (m.get("racing") or []):
-        await runpod_delete_endpoint_template(cand.get("endpoint_id"), cand.get("template_id"))
-    m["racing"] = None
     await runpod_delete_model(m)
     m["runpod"] = {}
     save_models(models)
@@ -943,11 +833,11 @@ async def models_start(model_id: str, req: StartModelRequest | None = None):
             )
         m["gpu_type_ids"] = [gpu_id]
         m["runpod"] = await runpod_create_model(
-            m["served_name"], m["repo"], m["file"], runpod_gpu_ids_for(gpu_id), m.get("recommended_context_window"),
+            m["served_name"], m["repo"], m["file"], [gpu_id], m.get("recommended_context_window"),
         )
         save_models(models)
     elif gpu_id and gpu_id != (m.get("gpu_type_ids") or [None])[0]:
-        await runpod_retarget_gpu(m["runpod"]["template_id"], m["runpod"]["endpoint_id"], runpod_gpu_ids_for(gpu_id))
+        await runpod_retarget_gpu(m["runpod"]["endpoint_id"], [gpu_id])
         m["gpu_type_ids"] = [gpu_id]
         save_models(models)
 
@@ -970,56 +860,40 @@ async def models_start(model_id: str, req: StartModelRequest | None = None):
 @app.post("/api/models/{model_id}/fast-start")
 async def models_fast_start(model_id: str):
     """Start on several of the cheapest GPU tiers that fit this model at
-    once, instead of waiting out one tier at a time — Runpod capacity
-    varies enough by exact tier that a single pick can sit IN_QUEUE for
-    a tier that happens to be empty while another is wide open right
-    now (see README "Known limitations"). _check_fast_start_races keeps
-    whichever tier gets a worker first and tears the rest down, usually
-    within one BACKGROUND_CHECK_INTERVAL_SECONDS tick — so more than one
-    tier briefly running (and billing) at once is possible, just capped
-    to FAST_START_MAX_TIERS and settled quickly."""
+    once, instead of waiting out one tier at a time and hoping it has
+    capacity (see README "Known limitations"). Unlike the old v1-era
+    design, this is a *single* endpoint whose gpu.pools lists every
+    candidate tier — Runpod schedules the endpoint's one worker onto
+    whichever pool has room first. There's only ever one worker slot, so
+    unlike racing separate endpoints there's no way to end up paying for
+    more than one GPU at once; the tradeoff is just that the actual
+    price depends on which tier it lands in, which the picker's per-tier
+    estimate can only approximate."""
     models = load_models()
     m = next((x for x in models if x["id"] == model_id), None)
     if not m:
         raise HTTPException(status_code=404, detail="model not found")
-    if m.get("racing"):
-        raise HTTPException(status_code=409, detail="a fast-start race is already running for this model")
     if (m.get("runpod") or {}).get("endpoint_id"):
         await runpod_delete_model(m)
         m["runpod"] = {}
 
-    tiers = fast_start_tiers_for(m.get("estimated_vram_gb"))
-    if not tiers:
+    gpu_ids = await fast_start_tiers_for(m.get("estimated_vram_gb"))
+    if not gpu_ids:
         raise HTTPException(status_code=400, detail="no GPU tier fits this model")
 
-    candidates = []
-    errors = []
-    for i, gpu_id in enumerate(tiers):
-        try:
-            rp = await runpod_create_model(
-                m["served_name"], m["repo"], m["file"], runpod_gpu_ids_for(gpu_id),
-                m.get("recommended_context_window"), name_suffix=f"-race{i}",
-            )
-        except HTTPException as e:
-            errors.append(f"{gpu_id}: {e.detail}")
-            continue
-        warmup = await _warm_runpod(rp["endpoint_id"], m["served_name"])
-        if not warmup["submitted"]:
-            await runpod_delete_endpoint_template(rp.get("endpoint_id"), rp.get("template_id"))
-            errors.append(f"{gpu_id}: {warmup['error']}")
-            continue
-        candidates.append({"gpu_id": gpu_id, **rp})
-
-    if not candidates:
-        raise HTTPException(status_code=502, detail=f"couldn't start any GPU tier: {'; '.join(errors)}")
-
-    m["racing"] = candidates
-    m["gpu_type_ids"] = [c["gpu_id"] for c in candidates]
+    m["gpu_type_ids"] = gpu_ids
+    m["runpod"] = await runpod_create_model(
+        m["served_name"], m["repo"], m["file"], gpu_ids, m.get("recommended_context_window"),
+    )
+    warmup = await _warm_runpod(m["runpod"]["endpoint_id"], m["served_name"])
     m["last_start_attempt"] = time.time()
     save_models(models)
-    log.warning("Fast-start racing model %s across %s", model_id, [c["gpu_id"] for c in candidates])
-    return {**m, "note": f"racing {len(candidates)} GPU tier(s) ({', '.join(c['gpu_id'] for c in candidates)}) — "
-                          f"keeping whichever gets a worker first and tearing the rest down automatically."}
+    log.warning("Fast-starting model %s across GPU tiers %s", model_id, gpu_ids)
+    if not warmup["submitted"]:
+        raise HTTPException(status_code=502, detail=f"warm-up request failed: {warmup['error']}")
+    return {**m, "warmup": warmup,
+            "note": f"one endpoint spanning {len(gpu_ids)} GPU tier(s) ({', '.join(gpu_ids)}) — Runpod will "
+                    f"schedule the worker on whichever has capacity first."}
 
 
 @app.post("/api/models/{model_id}/auto-stop")
@@ -1040,8 +914,6 @@ async def models_remove(model_id: str):
     m = next((x for x in models if x["id"] == model_id), None)
     if not m:
         raise HTTPException(status_code=404, detail="model not found")
-    for cand in (m.get("racing") or []):
-        await runpod_delete_endpoint_template(cand.get("endpoint_id"), cand.get("template_id"))
     await runpod_delete_model(m)
     models = [x for x in models if x["id"] != model_id]
     save_models(models)

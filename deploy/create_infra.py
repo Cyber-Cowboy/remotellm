@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Idempotent-ish bootstrap of the Runpod infrastructure via the REST API:
+Idempotent-ish bootstrap of the shared Runpod infrastructure via the v2
+REST API (api.runpod.io/v2 — v1's rest.runpod.io was retired 2026-11-15):
 
-    1. a Network Volume (persistent GGUF storage, survives worker restarts)
-    2. a Serverless Template (docker image + env vars)
-    3. a Serverless Endpoint (Flex workers, workersMin=0, attached to the volume)
+    1. a container registry credential (for a private Docker Hub image)
+    2. a Network Volume (persistent GGUF storage, survives worker restarts)
+    3. a Serverless Endpoint (Flex workers, workers.min=0, attached to the volume)
+
+v2 has no separate Template resource — image/env/ports go straight on the
+endpoint, so this bootstrap is one resource shorter than it used to be.
 
 Usage:
     export RUNPOD_API_KEY=...
@@ -27,7 +31,7 @@ from pathlib import Path
 
 import httpx
 
-API = "https://rest.runpod.io/v1"
+API = "https://api.runpod.io/v2"
 STATE_FILE = Path(__file__).parent / "infra_state.json"
 
 
@@ -48,6 +52,23 @@ def api(method: str, path: str, api_key: str, **kwargs) -> dict:
         print(f"ERROR {method} {path} -> {r.status_code}: {r.text}", file=sys.stderr)
         r.raise_for_status()
     return r.json()
+
+
+def gpu_pools_for(gpu_type_ids: list[str], api_key: str) -> list[str]:
+    """Map literal GPU ids (e.g. "NVIDIA A100 80GB PCIe") to their v2
+    catalog pool (e.g. "AMPERE_80") — v2 endpoints select on pools, not
+    individual ids; see GET /v2/catalog/gpus."""
+    catalog = api("GET", "/catalog/gpus", api_key, params={"product": "SERVERLESS"})["gpus"]
+    by_id = {g["id"]: g.get("pool") for g in catalog}
+    pools, seen = [], set()
+    for gpu_id in gpu_type_ids:
+        pool = by_id.get(gpu_id)
+        if not pool:
+            sys.exit(f"unknown or non-poolable Runpod GPU id: {gpu_id!r}")
+        if pool not in seen:
+            seen.add(pool)
+            pools.append(pool)
+    return pools
 
 
 def main():
@@ -75,7 +96,7 @@ def main():
     if "registry_auth_id" in state:
         print(f"reusing existing container registry auth {state['registry_auth_id']}")
     elif args.registry_username and args.registry_password:
-        reg = api("POST", "/containerregistryauth", api_key, json={
+        reg = api("POST", "/registries", api_key, json={
             "name": f"{args.name}-dockerhub",
             "username": args.registry_username,
             "password": args.registry_password,
@@ -90,16 +111,16 @@ def main():
     if "network_volume_id" in state:
         print(f"reusing existing network volume {state['network_volume_id']}")
     else:
-        vol = api("POST", "/networkvolumes", api_key, json={
+        vol = api("POST", "/network-volumes", api_key, json={
             "name": f"{args.name}-model-storage",
-            "dataCenterId": args.data_center,
+            "dataCenter": args.data_center,
             "size": args.volume_size_gb,
         })
         state["network_volume_id"] = vol["id"]
         save_state(state)
         print(f"created network volume {vol['id']} ({args.volume_size_gb} GB in {args.data_center})")
 
-    # 2. Template
+    # 2. Endpoint (image/env/ports go straight on it — v2 has no separate template)
     env = {
         "SERVED_MODEL_NAME": os.environ.get("SERVED_MODEL_NAME", "gpt-oss-120b-uncensored"),
         "MODEL_REPO": os.environ.get("MODEL_REPO", "HauhauCS/GPTOSS-120B-Uncensored-HauhauCS-Aggressive"),
@@ -113,43 +134,26 @@ def main():
     if args.hf_token:
         env["HF_TOKEN"] = args.hf_token  # only ever sent over HTTPS into Runpod's own secret store
 
-    if "template_id" in state:
-        print(f"reusing existing template {state['template_id']}")
-    else:
-        tmpl_body = {
-            "name": f"{args.name}-template",
-            "imageName": args.image,
-            "category": "NVIDIA",
-            "isServerless": True,
-            "containerDiskInGb": 20,  # image itself is small; the model lives on the network volume
-            "ports": ["8080/http"],
-            "env": env,
-        }
-        if "registry_auth_id" in state:
-            tmpl_body["containerRegistryAuthId"] = state["registry_auth_id"]
-        tmpl = api("POST", "/templates", api_key, json=tmpl_body)
-        state["template_id"] = tmpl["id"]
-        save_state(state)
-        print(f"created template {tmpl['id']}")
-
-    # 3. Endpoint
     if "endpoint_id" in state:
         print(f"reusing existing endpoint {state['endpoint_id']}")
     else:
-        ep = api("POST", "/endpoints", api_key, json={
+        pools = gpu_pools_for(args.gpu_type_ids, api_key)
+        ep_body = {
             "name": args.name,
-            "templateId": state["template_id"],
-            "computeType": "GPU",
-            "gpuTypeIds": args.gpu_type_ids,
-            "gpuCount": 1,
-            "workersMin": 0,          # <-- Active Workers = 0 (scale-to-zero)
-            "workersMax": args.workers_max,
-            "idleTimeout": args.idle_timeout,
-            "flashboot": True,
-            "networkVolumeId": state["network_volume_id"],
-            "scalerType": "QUEUE_DELAY",
-            "scalerValue": 1,
-        })
+            "image": args.image,
+            "type": "QUEUE",
+            "disk": 20,  # image itself is small; the model lives on the network volume
+            "ports": ["8080/http"],
+            "env": env,
+            "gpu": {"pools": pools},
+            "workers": {"min": 0, "max": args.workers_max, "idleTimeout": args.idle_timeout},  # min=0 -> scale-to-zero
+            "scaling": {"type": "QUEUE_DELAY", "queueDelay": 1},
+            "flashboot": "FLASHBOOT",
+            "mounts": {"network": [{"volumeId": state["network_volume_id"]}]},
+        }
+        if "registry_auth_id" in state:
+            ep_body["registry"] = state["registry_auth_id"]
+        ep = api("POST", "/serverless", api_key, json=ep_body)
         state["endpoint_id"] = ep["id"]
         save_state(state)
         print(f"created endpoint {ep['id']}")
