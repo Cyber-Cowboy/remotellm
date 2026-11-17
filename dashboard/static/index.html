@@ -175,6 +175,11 @@ async function refreshRunpod() {
       dot.className = 'dot off';
       return;
     }
+    if (s.account && s.account.error) {
+      rows.innerHTML = row('Error', s.account.error);
+      dot.className = 'dot err';
+      return;
+    }
     const bal = s.account && s.account.clientBalance;
     const spend = s.account && s.account.currentSpendPerHr;
     dot.className = 'dot ' + (spend > 0.02 ? 'on' : 'off');

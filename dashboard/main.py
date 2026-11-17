@@ -401,14 +401,20 @@ async def models_resolve(req: ResolveRequest):
 async def runpod_account() -> dict:
     if not RUNPOD_API_KEY:
         return {"error": "RUNPOD_API_KEY not set"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(
-            "https://api.runpod.io/graphql",
-            headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
-            json={"query": "query { myself { clientBalance currentSpendPerHr } }"},
-        )
-        r.raise_for_status()
-        return r.json()["data"]["myself"]
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://api.runpod.io/graphql",
+                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+                json={"query": "query { myself { clientBalance currentSpendPerHr } }"},
+            )
+            r.raise_for_status()
+            return r.json()["data"]["myself"]
+    except httpx.HTTPError as e:
+        # A real Runpod-side outage (e.g. DNS not resolving for one of
+        # their subdomains) must surface as a clean error, not an
+        # unhandled 500 — this call runs on every dashboard page load.
+        return {"error": f"couldn't reach Runpod: {e}"}
 
 
 _gpu_stock_cache: dict = {"at": 0.0, "data": {}}
@@ -447,15 +453,22 @@ async def runpod_gpu_stock() -> dict[str, str | None]:
 
 
 async def runpod_workers(endpoint_id: str) -> dict | None:
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"https://api.runpod.io/v2/serverless/{endpoint_id}/workers",
-            headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
-        )
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        return r.json()
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"https://api.runpod.io/v2/serverless/{endpoint_id}/workers",
+                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+            )
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPError as e:
+        # Called from both request-serving code and the background loop —
+        # a transient Runpod-side outage must not crash either; the
+        # caller treats "no worker info" the same as "nothing running yet".
+        log.warning("couldn't fetch worker status for endpoint %s: %s", endpoint_id, e)
+        return None
 
 
 async def runpod_create_model(served_name: str, repo: str, filename: str, gpu_ids: list[str],
@@ -482,44 +495,52 @@ async def runpod_create_model(served_name: str, repo: str, filename: str, gpu_id
         "MAX_CONCURRENT": os.environ.get("MAX_CONCURRENT", "2"),
     }
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        tmpl_body = {
-            # Runpod holds a deleted endpoint's template "pending cleanup"
-            # for up to ~90 minutes before its name is free again — a
-            # purely served_name-derived name collides on the very next
-            # Stop -> Start within that window ("Template name must be
-            # unique"). A short suffix sidesteps it rather than hoping
-            # the timing never lines up.
-            "name": f"gptoss-{served_name}-template-{int(time.time())}{name_suffix}",
-            "imageName": f"docker.io/{DOCKERHUB_USERNAME}/gptoss-120b-worker:latest",
-            "category": "NVIDIA", "isServerless": True, "containerDiskInGb": 20,
-            "ports": ["8080/http"], "env": env,
-        }
-        if registry_auth_id:
-            tmpl_body["containerRegistryAuthId"] = registry_auth_id
-        tmpl = await client.post("https://rest.runpod.io/v1/templates", headers=headers, json=tmpl_body)
-        if tmpl.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"template create failed: {tmpl.text}")
-        template_id = tmpl.json()["id"]
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            tmpl_body = {
+                # Runpod holds a deleted endpoint's template "pending cleanup"
+                # for up to ~90 minutes before its name is free again — a
+                # purely served_name-derived name collides on the very next
+                # Stop -> Start within that window ("Template name must be
+                # unique"). A short suffix sidesteps it rather than hoping
+                # the timing never lines up.
+                "name": f"gptoss-{served_name}-template-{int(time.time())}{name_suffix}",
+                "imageName": f"docker.io/{DOCKERHUB_USERNAME}/gptoss-120b-worker:latest",
+                "category": "NVIDIA", "isServerless": True, "containerDiskInGb": 20,
+                "ports": ["8080/http"], "env": env,
+            }
+            if registry_auth_id:
+                tmpl_body["containerRegistryAuthId"] = registry_auth_id
+            tmpl = await client.post("https://rest.runpod.io/v1/templates", headers=headers, json=tmpl_body)
+            if tmpl.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"template create failed: {tmpl.text}")
+            template_id = tmpl.json()["id"]
 
-        ep_body = {
-            "name": f"gptoss-{served_name}-{int(time.time())}{name_suffix}",
-            "templateId": template_id,
-            "computeType": "GPU",
-            "gpuTypeIds": gpu_ids,
-            "gpuCount": 1,
-            "workersMin": 0,
-            "workersMax": 1,
-            "idleTimeout": RUNPOD_IDLE_TIMEOUT_SECONDS,
-            "flashboot": True,
-            "networkVolumeId": network_volume_id,
-            "scalerType": "QUEUE_DELAY",
-            "scalerValue": 1,
-        }
-        ep = await client.post("https://rest.runpod.io/v1/endpoints", headers=headers, json=ep_body)
-        if ep.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"endpoint create failed: {ep.text}")
-        endpoint_id = ep.json()["id"]
+            ep_body = {
+                "name": f"gptoss-{served_name}-{int(time.time())}{name_suffix}",
+                "templateId": template_id,
+                "computeType": "GPU",
+                "gpuTypeIds": gpu_ids,
+                "gpuCount": 1,
+                "workersMin": 0,
+                "workersMax": 1,
+                "idleTimeout": RUNPOD_IDLE_TIMEOUT_SECONDS,
+                "flashboot": True,
+                "networkVolumeId": network_volume_id,
+                "scalerType": "QUEUE_DELAY",
+                "scalerValue": 1,
+            }
+            ep = await client.post("https://rest.runpod.io/v1/endpoints", headers=headers, json=ep_body)
+            if ep.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"endpoint create failed: {ep.text}")
+            endpoint_id = ep.json()["id"]
+    except httpx.HTTPError as e:
+        # rest.runpod.io (template/endpoint management) is a separate
+        # subdomain from api.runpod.io (GraphQL) and api.runpod.ai (job
+        # API) — seen in practice to have its own outages (DNS not
+        # resolving at all) while the other two stayed up. Surface that
+        # as a clear 502 instead of an unhandled 500.
+        raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API (rest.runpod.io): {e}")
     return {"template_id": template_id, "endpoint_id": endpoint_id}
 
 
@@ -528,13 +549,16 @@ async def runpod_retarget_gpu(template_id: str, endpoint_id: str, gpu_ids: list[
     need to delete/recreate, which would briefly drop the model off the
     "tracked" list for no reason."""
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.patch(
-            f"https://rest.runpod.io/v1/endpoints/{endpoint_id}",
-            headers=headers, json={"gpuTypeIds": gpu_ids},
-        )
-        if r.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"GPU retarget failed: {r.text}")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.patch(
+                f"https://rest.runpod.io/v1/endpoints/{endpoint_id}",
+                headers=headers, json={"gpuTypeIds": gpu_ids},
+            )
+            if r.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"GPU retarget failed: {r.text}")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API (rest.runpod.io): {e}")
 
 
 async def _warm_runpod(endpoint_id: str, served_name: str) -> dict:
@@ -562,13 +586,20 @@ async def _warm_runpod(endpoint_id: str, served_name: str) -> dict:
 
 
 async def runpod_delete_endpoint_template(endpoint_id: str | None, template_id: str | None) -> None:
-    async with httpx.AsyncClient(timeout=30) as client:
-        for rid, path in ((endpoint_id, "endpoints"), (template_id, "templates")):
-            if rid:
-                await client.delete(
-                    f"https://rest.runpod.io/v1/{path}/{rid}",
-                    headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
-                )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            for rid, path in ((endpoint_id, "endpoints"), (template_id, "templates")):
+                if rid:
+                    await client.delete(
+                        f"https://rest.runpod.io/v1/{path}/{rid}",
+                        headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+                    )
+    except httpx.HTTPError as e:
+        # Left not-torn-down on Runpod's side rather than marked stopped
+        # here while still live there — callers clear local state only
+        # after this returns, so a failed delete surfaces instead of
+        # silently losing track of a still-billing endpoint.
+        raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API (rest.runpod.io) to delete: {e}")
 
 
 async def runpod_delete_model(m: dict) -> None:
@@ -681,13 +712,16 @@ async def runpod_teardown():
     state = load_state()
     volume_id = state.get("network_volume_id")
     if volume_id:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.delete(
-                f"https://rest.runpod.io/v1/networkvolumes/{volume_id}",
-                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
-            )
-            if r.status_code not in (200, 204, 404):
-                raise HTTPException(status_code=502, detail=f"volume delete failed: {r.text}")
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.delete(
+                    f"https://rest.runpod.io/v1/networkvolumes/{volume_id}",
+                    headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+                )
+                if r.status_code not in (200, 204, 404):
+                    raise HTTPException(status_code=502, detail=f"volume delete failed: {r.text}")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"couldn't reach Runpod's API (rest.runpod.io): {e}")
     save_state({})
     save_models([])
     log.warning("Runpod full teardown: removed models %s + shared volume", deleted_models)
