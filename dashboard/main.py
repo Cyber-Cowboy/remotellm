@@ -569,9 +569,12 @@ async def _check_auto_stop() -> None:
     as a manual Stop) once `auto_stop_minutes` have passed since its last
     request — independent of Runpod's own worker-level idleTimeout, which
     only scales the GPU to zero and leaves the endpoint itself sitting
-    there. Measured from the last real request if there's been one, else
-    from when it was last started, so a model nobody ever used doesn't
-    linger forever but also isn't killed before anyone got to try it."""
+    there. Measured from whichever of "last real request" / "last
+    started" is more recent, not just preferring last_request_at
+    unconditionally — that field never clears across a Stop/Start cycle,
+    so a model started long after its last request would otherwise look
+    idle from the moment it starts and get auto-stopped within the very
+    first background-loop tick, before it ever got a chance to warm up."""
     models = load_models()
     changed = False
     for m in models:
@@ -580,7 +583,10 @@ async def _check_auto_stop() -> None:
             continue
         if not (m.get("runpod") or {}).get("endpoint_id"):
             continue
-        reference = m.get("last_request_at") or m.get("last_start_attempt") or m.get("created_at")
+        reference = max(
+            (t for t in (m.get("last_request_at"), m.get("last_start_attempt")) if t),
+            default=m.get("created_at"),
+        )
         if not reference or time.time() - reference < minutes * 60:
             continue
         log.warning("Auto-stopping model %s after %s min with no requests", m["id"], minutes)
